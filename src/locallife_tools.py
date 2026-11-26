@@ -23,6 +23,8 @@ v5（2026-11-26 实测后）：
   - 复数关键词可匹配单数；菜系与饮食条件同时出现时取交集，门店结果带 diet 字段。
   - 周边查询支持指定关键词上限，供甜品默认查询使用全部 9 个词。
 
+v5.5：程序端关键词仅匹配单词开头，门店保留饮食标签的 yes/only 状态。
+
 所有失败都抛 ToolError(code, message)，由工作流决定重试、降级还是追问用户，不让模型自己猜。
 设置环境变量 LL_FAULT 可以人为制造故障，用于评测异常分支，例如：
   LL_FAULT=overpass_down,search_down   多个用逗号分隔，取值见 FAULTS。
@@ -408,6 +410,7 @@ class Shop:
     walk_min: int = 0
     open_now: str = "unknown"
     diet: str = ""
+    diet_tags: Dict[str, str] = field(default_factory=dict)
 
     def to_dict(self) -> Dict[str, Any]:
         return asdict(self)
@@ -435,10 +438,11 @@ def _kw_pattern(kws: List[str]) -> str:
 
 
 DIET_KW = ("vegan", "vegetarian", "halal")  # OSM 用 diet:vegan=yes 这类标签表示，不写在 cuisine 里
+_WORD_START = r"(?<![^\W_])"  # 字符串开头，或前一个字符不是字母或数字（下划线也可分隔）
 
 
-def _diet_words(tags: Dict[str, str]) -> List[str]:
-    return [d for d in DIET_KW if tags.get(f"diet:{d}") in ("yes", "only")]
+def _diet_tags(tags: Dict[str, str]) -> Dict[str, str]:
+    return {d: tags[f"diet:{d}"] for d in DIET_KW if tags.get(f"diet:{d}") in ("yes", "only")}
 
 
 def _overpass_query(lat: float, lon: float, radius: int, amenities: Tuple[str, ...],
@@ -458,7 +462,7 @@ def _overpass_query(lat: float, lon: float, radius: int, amenities: Tuple[str, .
 
 def tag_text(tags: Dict[str, str]) -> str:
     """程序端匹配口味用的文本：店名 + 菜系 + 饮食标签。"""
-    return f"{tags.get('name', '')} {tags.get('cuisine', '')} {' '.join(_diet_words(tags))}"
+    return f"{tags.get('name', '')} {tags.get('cuisine', '')} {' '.join(_diet_tags(tags))}"
 
 
 # 熔断：某台服务器超时或报错后，接下来 CIRCUIT_SECONDS 秒内直接跳过它。
@@ -540,7 +544,7 @@ def nearby(lat: float, lon: float, *, radius: int = 800, keywords: Optional[List
            keyword_limit: int = _DEFAULT_KEYWORD_LIMIT) -> Dict[str, Any]:
     """查周边门店，返回 {shops, server, data_time, radius, cached, ...}。
 
-    快照覆盖范围且数据够新时优先使用。程序端按名称和菜系匹配任一菜系关键词，
+    快照覆盖范围且数据够新时优先使用。程序端按名称和菜系的单词开头匹配任一菜系关键词，
     有菜系关键词时要求满足所有饮食条件，只有饮食关键词时满足任一条件即可。
     """
     kws = clean_keywords(keywords, limit=keyword_limit)
@@ -577,8 +581,8 @@ def nearby(lat: float, lon: float, *, radius: int = 800, keywords: Optional[List
     elements = [] if "overpass_empty" in faults else payload["elements"]
 
     cuisine_kws = [k for k in kws if k not in DIET_KW]
-    diet_kws = [d for d in DIET_KW if d in kws]
-    cuisine_re = re.compile(_kw_pattern(cuisine_kws), re.I) if cuisine_kws else None
+    cuisine_re = re.compile(rf"{_WORD_START}(?:{_kw_pattern(cuisine_kws)})", re.I) if cuisine_kws else None
+    diet_patterns = [re.compile(_WORD_START + d, re.I) for d in DIET_KW if d in kws]
     diet_matches = all if cuisine_kws else any
     shops: List[Shop] = []
     seen = set()
@@ -594,9 +598,9 @@ def nearby(lat: float, lon: float, *, radius: int = 800, keywords: Optional[List
         cuisine = t.get("cuisine", "")
         if cuisine_re and not (cuisine_re.search(name) or cuisine_re.search(cuisine)):
             continue
-        if diet_kws:
-            text = tag_text(t).lower()
-            if not diet_matches(d in text for d in diet_kws):
+        if diet_patterns:
+            text = tag_text(t)
+            if not diet_matches(pattern.search(text) for pattern in diet_patterns):
                 continue
         dedup = (name.lower(), round(plat, 4), round(plon, 4))
         if dedup in seen:
@@ -604,12 +608,13 @@ def nearby(lat: float, lon: float, *, radius: int = 800, keywords: Optional[List
         seen.add(dedup)
         d = distance_m(lat, lon, plat, plon)
         addr = " ".join(x for x in (t.get("addr:housenumber", ""), t.get("addr:street", "")) if x)
+        diet_tags = _diet_tags(t)
         shops.append(Shop(
             name=name, lat=plat, lon=plon, amenity=t.get("amenity", ""), cuisine=cuisine,
             opening_hours=t.get("opening_hours", ""), address=addr, postcode=t.get("addr:postcode", ""),
             website=t.get("website") or t.get("contact:website", ""), phone=t.get("phone") or t.get("contact:phone", ""),
             osm_id=f"{el.get('type', 'node')}/{el.get('id')}", distance_m=round(d), walk_min=walk_minutes(d),
-            open_now=open_status(t.get("opening_hours", ""), now), diet=";".join(_diet_words(t))))
+            open_now=open_status(t.get("opening_hours", ""), now), diet=";".join(diet_tags), diet_tags=diet_tags))
     shops.sort(key=lambda s: s.distance_m)
     stale = _data_age_days(payload["data_time"])
     return {"shops": [s.to_dict() for s in shops], "server": payload["server"], "data_time": payload["data_time"],

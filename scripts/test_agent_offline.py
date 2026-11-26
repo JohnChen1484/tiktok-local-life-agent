@@ -56,15 +56,16 @@ def fake_geocode(text, **_):
     raise L.ToolError("LOCATION_NOT_FOUND", text)
 
 
-def shop(name, d, open_now="unknown", cuisine="indian", amenity="restaurant", hours="", diet=""):
+def shop(name, d, open_now="unknown", cuisine="indian", amenity="restaurant", hours="", diet_tags=None):
     return {"name": name, "lat": 52.47, "lon": -1.89, "amenity": amenity, "cuisine": cuisine, "opening_hours": hours,
             "address": "", "postcode": "", "website": "", "phone": "", "osm_id": f"node/{abs(hash(name)) % 999}",
-            "distance_m": d, "walk_min": L.walk_minutes(d), "open_now": open_now, "diet": diet}
+            "distance_m": d, "walk_min": L.walk_minutes(d), "open_now": open_now, "diet_tags": diet_tags or {}}
 
 
 MAP = {"mode": "ok", "calls": []}
-SHOPS = [shop("Asha's", 440, "open", hours="Mo-Su 12:00-23:00", diet="vegan;halal"),
-         shop("Dishoom", 479), shop("Indico", 498, "closed"),
+SHOPS = [shop("Asha's", 440, "open", hours="Mo-Su 12:00-23:00",
+              diet_tags={"vegan": "yes", "vegetarian": "only", "halal": "yes"}),
+         shop("Dishoom", 479, diet_tags={"vegan": "only"}), shop("Indico", 498, "closed"),
          shop("Wrapchic", 199, "closed", "indian;burrito", "fast_food")]
 
 
@@ -163,7 +164,7 @@ g = A.build_agent(checkpointer=MemorySaver())
 reset()
 LLM["parse"]["Indian food near New Street"] = slots(location="New Street", keywords=["indian", "curry"], category="restaurant")
 text, js = run(g, "Indian food near New Street", "n1")
-ok("正常推荐：status ok、版本号 w5.4、3+ 家、位置来自用户", js["status"] == "ok" and js["version"] == A.AGENT_VERSION == "w5.4"
+ok("正常推荐：status ok、版本号 w5.5、3+ 家、位置来自用户", js["status"] == "ok" and js["version"] == A.AGENT_VERSION == "w5.5"
    and len(js["shops"]) >= 3 and js["location"]["origin"] == "user")
 ok("口味关键词和类别传给地图工具", MAP["calls"][0]["keywords"] == ["indian", "curry"] and MAP["calls"][0]["amenities"] == A.CATEGORY_AMENITIES["restaurant"])
 ok("注入内容、过时、别的城市的搜索结果都没进来源", js["search"]["dropped_suspicious"] == 1 and js["search"]["stale"] == 1
@@ -172,8 +173,34 @@ ok("被网页提到的店排在前面（Dishoom 被 2 条提到）", js["shops"]
 ok("正文后附数据说明和来源列表", "OpenStreetMap" in text and "Sources:" in text and "https://example.com" in text)
 ok("核对一次通过，拒稿列表为空", js["verify"]["ok"] and js["verify"]["attempts"] == 1
    and js["verify"]["rejected"] == [] and LLM["calls"] == ["parse", "answer"])
+system, user = LLM["answer_prompts"][0]
+ok("未问饮食时 FACTS.shops 不含 diet，提示也要求只在问及时提饮食选项",
+   all("diet" not in s and "diet_tags" not in s for s in prompt_facts(user)["shops"])
+   and "Do not mention dietary options unless the user asks" in system)
+
+reset()
+diet_question = "Vegan, vegetarian or halal options near New Street?"
+LLM["parse"][diet_question] = slots(location="New Street", keywords=["vegan", "vegetarian", "halal", "options"])
+_, js = run(g, diet_question, "diet-options")
 diets = {s["name"]: s["diet"] for s in prompt_facts(LLM["answer_prompts"][0][1])["shops"]}
-ok("门店 diet 随 FACTS.shops 送入回答模型", diets["Asha's"] == "vegan;halal" and diets["Dishoom"] == "")
+ok("饮食标签用 options、only 或 halal 表示，未标注时为空",
+   diets["Asha's"] == "vegan options; vegetarian only; halal" and diets["Dishoom"] == "vegan only" and diets["Indico"] == "")
+reset()
+vegan_question = "Vegan options near New Street"
+LLM["parse"][vegan_question] = slots(location="New Street", keywords=["vegan", "options"])
+_, js = run(g, vegan_question, "vegan-options")
+diets = {s["name"]: s["diet"] for s in prompt_facts(LLM["answer_prompts"][0][1])["shops"]}
+ok("只问 vegan 时只提供对应的饮食标签", diets["Asha's"] == "vegan options" and diets["Dishoom"] == "vegan only")
+
+generic = ["cheap", "eats", "eat", "food", "foods", "places", "spots", "options", "nice", "good", "best", "tasty", "local"]
+ok("通用描述词从口味关键词中剔除，保留菜系", A._fix_category(slots(keywords=[*generic, "thai"]))["keywords"] == ["thai"])
+reset()
+budget_question = "Cheap eats under £10 near Grand Central"
+LLM["parse"][budget_question] = slots(location="Grand Central", category="restaurant", keywords=["cheap", "eats"], budget_gbp=10)
+_, js = run(g, budget_question, "b01")
+ok("Cheap eats 按餐厅类别查找，保留预算，地图查询没有 cheap 或 eats",
+   js["request"]["budget_gbp"] == 10 and js["request"]["keywords"] == MAP["calls"][0]["keywords"] == []
+   and MAP["calls"][0]["amenities"] == A.CATEGORY_AMENITIES["restaurant"])
 
 # ---- 2 编造价格 → 重写；两次都编 → 模板
 reset()
@@ -198,6 +225,21 @@ ok("两次拒稿按顺序各保留前 300 字，数字问题排在六条反馈�
 
 print("\n—— 模板回答示例 ——\n" + text + "\n")
 
+# ---- 成组引用在核对和来源列表生成前拆开
+reset(search_items=[item(f"Cafe guide {i}", "Birmingham", url=f"https://example.com/cafe/{i}") for i in range(1, 9)])
+cafe_question = "Any cafe open now near Moor Street station?"
+LLM["parse"][cafe_question] = slots(location="Moor Street station", category="cafe", open_now=True)
+LLM["drafts"] = ["**Asha's** — [S4，S9].", "**Asha's** — [S4, S5, S8] [S1，S2] [S2/S3]."]
+text, js = run(g, cafe_question, "o02-citations")
+ok("中文逗号分隔的成组引用拆开后，不存在的编号会触发重写",
+   js["verify"]["ok"] and js["verify"]["attempts"] == 2 and js["verify"]["rejected"] == ["**Asha's** — [S4][S9]."]
+   and "[S9] is not a source id" in LLM["answer_prompts"][1][1])
+body, _, source_list = text.partition("Sources:\n")
+ok("英文逗号、中文逗号和斜线分隔的引用会拆开，来源列表覆盖所有被引用编号",
+   "[S4][S5][S8] [S1][S2] [S2][S3]" in body
+   and re.findall(r"^\[(S\d+)\]", source_list, re.M) == ["S1", "S2", "S3", "S4", "S5", "S8"]
+   and "each source ID in its own pair of brackets" in LLM["answer_prompts"][0][0])
+
 # ---- 3 模型理解失败 → 规则兜底
 reset()
 LLM["parse_fail"] = True
@@ -205,6 +247,15 @@ text, js = run(g, "Any curry near the Mailbox open now?", "n4")
 ok("理解模型失败 → 规则兜底：认出地标、口味和「现在营业」", js["status"] == "degraded" and "parse_rules" in js["degraded"]
    and js["location"]["name"] == "The Mailbox" and "curry" in js["request"]["keywords"] and js["request"]["open_now"])
 ok("要求现在营业：已打烊的店被排除", all(s["open_now"] != "closed" for s in js["shops"]) and js["rank"]["excluded_closed"] == 2)
+rank_state = {"lang": "en", "place": A.DEFAULT_PLACE, "shops": [
+    shop("Nearby Unknown", 10), shop("Far Open", 700, "open"), shop("Closer Open", 500, "open"), shop("Closed", 5, "closed"),
+]}
+ranked = A.node_rank(dict(rank_state, slots=slots(open_now=True)))
+picks = ranked["picks"]
+ok("要求现在营业时，较远且分数较低的营业门店仍先于未知门店，同状态按分数排序",
+   [p["name"] for p in picks] == ["Closer Open", "Far Open", "Nearby Unknown"]
+   and picks[-1]["score"] > picks[0]["score"] and ranked["rank_info"]["excluded_closed"] == 1)
+ok("普通推荐仍按分数优先", A.node_rank(dict(rank_state, slots=slots()))["picks"][0]["name"] == "Nearby Unknown")
 
 # ---- 4 位置问题
 reset()

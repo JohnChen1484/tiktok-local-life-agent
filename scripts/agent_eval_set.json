@@ -16,7 +16,7 @@
      "expect": {"status": ["ok"], "min_shops": 1, "keywords_any": ["vegan"]}},
     {"id": "N07", "category": "normal", "turns": ["New Street 附近有什么好吃的日料？"],
      "expect": {"status": ["ok"], "min_shops": 1, "keywords_any": ["japanese", "sushi", "ramen"], "lang": "zh"}},
-    {"id": "N08", "category": "normal", "turns": ["Sushi near Selly Oak"],
+    {"id": "N08", "category": "normal", "turns": ["Coffee near Selly Oak"],
      "expect": {"status": ["ok"], "min_shops": 1, "location_contains": "Selly Oak"}},
     {"id": "N09", "category": "normal", "turns": ["Halal burgers near Aston University"],
      "expect": {"status": ["ok"], "min_shops": 1, "keywords_any": ["halal", "burger"]}},

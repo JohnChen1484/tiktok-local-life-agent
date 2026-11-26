@@ -43,7 +43,7 @@ import locallife_tools as L  # noqa: E402
 
 logger = logging.getLogger(__name__)
 
-AGENT_VERSION = "w5.4"  # 写进每个回答的 json，评测报告据此确认是哪个版本在作答
+AGENT_VERSION = "w5.5"  # 写进每个回答的 json，评测报告据此确认是哪个版本在作答
 LLM_CONFIG = "config/agent_llm_config.json"
 MAX_MESSAGES = 40
 TOP_N = 5                # 最多推荐几家
@@ -62,10 +62,10 @@ CATEGORY_AMENITIES: Dict[str, Tuple[str, ...]] = {
     "any": L.FOOD_AMENITIES,
 }
 DEFAULT_DESSERT_KEYWORDS = ("dessert", "cake", "ice_cream", "waffle", "crepe", "bubble_tea", "gelato", "donut", "patisserie")
-# 这些词说明的是「类别」，不是口味：留作关键词会把没写菜系的咖啡馆、酒吧都筛掉
+# 类别词和泛词不参与口味筛选，以免漏掉没写菜系的门店或误配店名。
 GENERIC_KW = {"coffee", "cafe", "cafes", "pub", "pubs", "bar", "bars", "beer", "pint", "pints", "drinks", "drink",
-              "cocktail", "cocktails", "food", "restaurant", "restaurants", "eat", "dessert", "desserts", "dinner",
-              "lunch", "places"}
+              "cocktail", "cocktails", "restaurant", "restaurants", "dessert", "desserts", "dinner", "lunch",
+              "cheap", "eats", "eat", "food", "foods", "places", "spots", "options", "nice", "good", "best", "tasty", "local"}
 CAFE_KW = {"coffee", "cafe", "cafes"}
 BAR_KW = {"pub", "pubs", "bar", "bars", "beer", "pint", "pints", "cocktail", "cocktails", "drinks", "drink"}
 INTENTS = {"recommend", "followup", "chitchat", "off_topic"}
@@ -716,9 +716,10 @@ def node_rank(state: AgentState) -> Dict[str, Any]:
     max_d = max(int(map_info.get("radius") or 800), 1)
     trending = slots.get("want_trending")
     budget = slots.get("budget_gbp")
+    open_only = bool(slots.get("open_now"))
     picks, closed = [], 0
     for s in shops:
-        if slots.get("open_now") and s["open_now"] == "closed":
+        if open_only and s["open_now"] == "closed":
             closed += 1
             continue
         hit = [sources[i] for i in L.mentions(s["name"], sources)]
@@ -732,13 +733,13 @@ def node_rank(state: AgentState) -> Dict[str, Any]:
         score += 0.05 * bool(s["opening_hours"] or s["website"])
         if budget and budget <= 12 and s["amenity"] in ("fast_food", "food_court", "cafe"):
             score += 0.2
-        picks.append({"name": s["name"], "type": s["amenity"], "cuisine": s["cuisine"], "diet": s.get("diet", ""),
+        picks.append({"name": s["name"], "type": s["amenity"], "cuisine": s["cuisine"], "diet_tags": s.get("diet_tags", {}),
                       "distance_m": s["distance_m"],
                       "walk_min": s["walk_min"], "open_now": s["open_now"], "opening_hours": s["opening_hours"],
                       "address": " ".join(x for x in (s["address"], s["postcode"]) if x), "website": s["website"],
                       "osm_id": s["osm_id"], "sources": hot, "deal_sources": deals,
                       "tiktok_sources": [x["id"] for x in hit if x["tiktok"]], "score": round(score, 3)})
-    picks.sort(key=lambda p: (-p["score"], p["distance_m"]))
+    picks.sort(key=lambda p: (open_only and p["open_now"] != "open", -p["score"], p["distance_m"]))
     trend_note = ""
     if trending and picks:
         # 问热门时只推荐被来源提到过的店（试跑里没被提到的麦当劳靠距离排进了前五）
@@ -781,9 +782,11 @@ Write the reply in {language}, using ONLY the FACTS JSON. Rules:
 2. For each place give its distance and walking time exactly as in FACTS (say the walk is an estimate once),
    its opening status (open now / closed / hours not listed) and one short reason drawn from FACTS
    (cuisine, type, listed hours, mentioned by a source). If you mention hours, copy them exactly from
-   FACTS.opening_hours (24-hour clock).
+   FACTS.opening_hours (24-hour clock). Do not mention dietary options unless the user asks. If asked, use
+   FACTS.shops diet as written: "options" or "halal" means the venue offers those options; "only" marks an exclusive diet.
 3. Popularity, TikTok buzz, prices and ratings may only come from FACTS.sources snippets, with the source id in
-   brackets, e.g. [S2]. On any line that mentions TikTok and cites sources, every cited source must have tiktok=true.
+   brackets. Put each source ID in its own pair of brackets, e.g. [S2][S3]. On any line that mentions TikTok and cites
+   sources, every cited source must have tiktok=true.
    Never invent prices, ratings, reviews, dishes or deals. For deals about a place, use titles or snippets from its
    deal_sources only and cite them. If asked for deals and the places have no deal_sources, say you couldn't find a current deal.
 4. Do not recommend or bold any place that is not in FACTS.shops. If FACTS.shops is empty, list up to 3 useful
@@ -791,17 +794,32 @@ Write the reply in {language}, using ONLY the FACTS JSON. Rules:
 5. FACTS.notes are shown to the user separately: do not repeat them. Do not list URLs; sources are appended for you.
 6. Keep it under 170 words (Chinese: under 320 characters). Plain friendly tone, no headings."""
 
+_GROUPED_CITATIONS_RE = re.compile(r"\[\s*S\d+(?:\s*[,，/、／]\s*S\d+)+\s*\]")
+
 
 def _facts(state: AgentState) -> Dict[str, Any]:
     slots = state.get("slots") or {}
+    requested_diets = [d for d in L.DIET_KW if d in (slots.get("keywords") or [])]
+    shops = []
+    for p in state.get("picks") or []:
+        shop = {k: p[k] for k in ("name", "type", "cuisine", "distance_m", "walk_min", "open_now", "opening_hours",
+                                  "address", "sources", "deal_sources", "tiktok_sources")}
+        if requested_diets:
+            tags = p.get("diet_tags") or {}
+            labels = []
+            for diet in requested_diets:
+                if tags.get(diet) == "only":
+                    labels.append(f"{diet} only")
+                elif tags.get(diet) == "yes":
+                    labels.append(diet if diet == "halal" else f"{diet} options")
+            shop["diet"] = "; ".join(labels)
+        shops.append(shop)
     return {
         "uk_time": state.get("uk_time") or L.london_now().strftime("%a %H:%M"),
         "location": {"name": (state.get("place") or {}).get("name", ""), "origin": (state.get("place") or {}).get("origin", "")},
         "request": {k: slots.get(k) for k in ("keywords", "category", "open_now", "budget_gbp", "want_deals",
                                               "want_trending", "max_walk_min")},
-        "shops": [dict({k: p[k] for k in ("name", "type", "cuisine", "distance_m", "walk_min", "open_now", "opening_hours",
-                                          "address", "sources", "deal_sources", "tiktok_sources")}, diet=p.get("diet", ""))
-                  for p in state.get("picks") or []],
+        "shops": shops,
         "sources": [{"id": s["id"], "title": s["title"], "site": s["site"], "age_days": s["age_days"],
                      "tiktok": s["tiktok"], "snippet": s["snippet"][:220]} for s in state.get("sources") or []],
         "notes": state.get("notes") or [],
@@ -821,6 +839,7 @@ def node_answer(state: AgentState) -> Dict[str, Any]:
     except Exception as exc:  # noqa: BLE001
         logger.warning("answer 模型调用失败：%s: %s", type(exc).__name__, exc)
         draft = ""
+    draft = _GROUPED_CITATIONS_RE.sub(lambda m: "".join(f"[{sid}]" for sid in re.findall(r"S\d+", m[0])), draft)
     return {"draft": draft, "retry": int(state.get("retry") or 0) + 1}
 
 

@@ -132,6 +132,21 @@ ok("同一口味再查走缓存", L.nearby(52.4778, -1.8990, radius=800, keyword
 q = L._overpass_query(52.4, -1.9, 800, ("restaurant",), ['indian"];out;', "x", "hot_pot"])
 ok("关键词清洗：去掉引号分号等，太短的丢掉；hot_pot 可匹配 Hot Pot / hotpot",
    '"];out;' not in q.split("[name]")[1][:-len("out center tags;")] and "indianout" in q and "hot[ _]?pot" in q)
+word_start_data = {"elements": [
+    {"type": "node", "id": i, "lat": 52.478, "lon": -1.899,
+     "tags": {"name": name, "amenity": "restaurant", "cuisine": cuisine}}
+    for i, (name, cuisine) in enumerate((
+        ("Theatrix", ""), ("The Meat Shack", ""), ("Indian Streatery", ""), ("42Eatery", ""), ("CaféEatery", ""),
+        ("Scurry", "treat"), ("Eatery", ""), ("Primitivo Bar & Eatery", ""), ("Corner Café", "street_eatery"),
+        ("Curry Bowl", ""),
+    ), 20)
+]}
+sent.clear()
+h = fake_http({"mail.ru": lambda url, data: (sent.append(data["data"]), word_start_data)[1]})
+r = L.nearby(52.4778, -1.899, keywords=["eat", "curry"], http=h)
+ok("程序端关键词匹配词首，空格、标点和下划线可以分隔，服务器查询保持原样",
+   [s["name"] for s in r["shops"]] == ["Eatery", "Primitivo Bar & Eatery", "Corner Café", "Curry Bowl"]
+   and '[~"^(name|cuisine)$"~"eat|curry",i]' in sent[0])
 diet_data = {"elements": [
     {"type": "node", "id": i, "lat": 52.478, "lon": -1.899, "tags": {"amenity": "restaurant", **tags}}
     for i, tags in enumerate((
@@ -142,6 +157,7 @@ diet_data = {"elements": [
         {"name": "Plant Pizza", "cuisine": "pizza;vegan"},
         {"name": "Plant Grill", "cuisine": "burger;vegan"},
         {"name": "Soft Serve", "cuisine": "ice_cream", "diet:halal": "yes"},
+        {"name": "Nonvegan Cafe", "cuisine": "coffee"},
     ), 10)
 ]}
 sent.clear()
@@ -157,11 +173,14 @@ ok("halal burgers：在线只查菜系，程序端同时要求汉堡和清真",
    and "halal" not in sent[-1])
 ok("diet 字段只收录 yes/only 的标签，无标签时为空",
    {s["name"]: s["diet"] for s in r["shops"]} == {"Grill House": "vegan;halal", "Halal Burger Kitchen": ""})
+ok("门店同时保留饮食标签的 yes/only 原值，名称匹配不凭空添加标签",
+   {s["name"]: s["diet_tags"] for s in r["shops"]} == {"Grill House": {"vegan": "yes", "halal": "only"},
+                                                      "Halal Burger Kitchen": {}})
 r = L.nearby(52.4778, -1.899, keywords=["halal", "vegan", "burger"], http=h)
 ok("同时指定菜系和多个饮食关键词时，每项饮食条件都须满足",
    [s["name"] for s in r["shops"]] == ["Grill House"])
 r = L.nearby(52.4778, -1.899, keywords=["halal", "vegan"], http=h)
-ok("只有饮食关键词时，在线和程序端都按名称、菜系和 diet:* 标签取并集",
+ok("只有饮食关键词时按名称、菜系和 diet:* 标签取并集，Nonvegan 不匹配 vegan",
    [s["name"] for s in r["shops"]] == ["Grill House", "Halal Burger Kitchen", "Halal Tandoori",
                                       "Plant Pizza", "Plant Grill", "Soft Serve"]
    and sent[-1].count("nwr(") == 3 and '[~"^(name|cuisine)$"~"halal|vegan",i]' in sent[-1]
@@ -247,6 +266,7 @@ r = L.nearby(52.4778, -1.8990, keywords=["halal", "burgers"], http=h, snapshot=d
 ok("带口味的 800 米查询也直接用新快照，保留混合条件和饮食标签",
    r["snapshot_planned"] and not h.calls
    and {s["name"]: s["diet"] for s in r["shops"]} == {"Grill House": "vegan;halal", "Halal Burger Kitchen": ""})
+ok("已有快照的 diet:* 标签也能还原 yes/only", r["shops"][0]["diet_tags"] == {"vegan": "yes", "halal": "only"})
 on_limit = dict(today_snap, data_time=(snapshot_time - timedelta(days=L.PLANNED_SNAPSHOT_MAX_AGE)).isoformat(), elements=[])
 r = L.nearby(52.4778, -1.8990, http=h, snapshot=on_limit)
 ok("覆盖范围内的空快照仍优先使用，允许恰好达到天数上限",
@@ -288,16 +308,54 @@ ok("先主动用快照，扩大半径超出覆盖时仍走在线",
    r["tried_radii"] == [800, 1500] and not r["from_snapshot"] and len(r["shops"]) == 2 and len(h.calls) == 1)
 
 # ---- 快照构建，模拟在线响应，只写临时文件
+def run_snapshot_builder(path, http, *args):
+    log = io.StringIO()
+    with (patch.object(sys, "argv", ["build_poi_snapshot.py", *args]), patch.object(L, "SNAPSHOT_PATH", str(path)),
+          patch.object(L, "_http_json", http), redirect_stdout(log)):
+        try:
+            build_poi_snapshot.main()
+        except SystemExit as exc:
+            return exc.code, log.getvalue()
+    return 0, log.getvalue()
+
+
+first_shop = diet_data["elements"][0]
+build_shops = [dict(first_shop, id=i, tags=dict(first_shop["tags"], name=f"Shop {i}")) for i in range(1000)]
+rejection = build_poi_snapshot._snapshot_rejection
+ok("快照保护检查 remark 字段是否存在，空 remark 也拒绝", "remark" in rejection({"remark": ""}, 1000, None))
+ok("快照保护至少要求 500 家门店", "500" in rejection({}, 499, None) and rejection({}, 500, None) == "")
+old_build = {"elements": build_shops}
+ok("快照保护允许恰好达到现有门店数的 70%", "70%" in rejection({}, 699, old_build) and rejection({}, 700, old_build) == "")
 sent.clear()
-h = fake_http({"mail.ru": lambda url, data: (sent.append(data["data"]), diet_data)[1]})
+h = fake_http({"mail.ru": lambda url, data: (sent.append(data["data"]), {"elements": build_shops[:500]})[1]})
 with TemporaryDirectory() as tmp:
     path = Path(tmp) / "poi_snapshot.json"
-    with patch.object(sys, "argv", ["build_poi_snapshot.py"]), patch.object(L, "SNAPSHOT_PATH", str(path)), \
-         patch.object(L, "_http_json", h), redirect_stdout(io.StringIO()):
-        build_poi_snapshot.main()
+    code, _ = run_snapshot_builder(path, h)
     built = json.loads(path.read_text(encoding="utf-8"))
-ok("快照构建默认请求 6000 米，写入的快照保留饮食标签",
-   built["radius"] == 6000 and "around:6000," in sent[0] and built["elements"][0]["tags"]["diet:halal"] == "only")
+    ok("快照构建默认请求 6000 米，写入的快照保留饮食标签",
+       code == 0 and built["radius"] == 6000 and "around:6000," in sent[0] and built["elements"][0]["tags"]["diet:halal"] == "only")
+
+    path.write_text(json.dumps(old_build), encoding="utf-8")
+    h = fake_http({"mail.ru": {"elements": build_shops[:600]}, "overpass-api.de": {"elements": build_shops[:700]}})
+    code, log = run_snapshot_builder(path, h)
+    built = json.loads(path.read_text(encoding="utf-8"))
+    ok("首台返回过少时记录原因并换下一台，保留合格的新快照",
+       code == 0 and "70%" in log and h.calls == [L.OVERPASS_SERVERS[0][0], L.OVERPASS_MAIN]
+       and built["source"] == L.OVERPASS_MAIN and len(built["elements"]) == 700)
+
+    before = path.read_bytes()
+    with_remark = {"elements": build_shops, "remark": ""}
+    missing_lon = dict(build_shops[499], lon=None)
+    h = fake_http({"mail.ru": with_remark, "overpass-api.de": {"elements": build_shops[:499] + [missing_lon]}})
+    code, log = run_snapshot_builder(path, h)
+    ok("所有服务器均不合格时打印原因、非零退出并保留现有文件",
+       code != 0 and "remark" in log and "少于 500" in log and len(h.calls) == 2 and path.read_bytes() == before)
+
+    h = fake_http({"mail.ru": {"elements": build_shops[:1], "remark": "partial"}})
+    code, _ = run_snapshot_builder(path, h, "--force")
+    built = json.loads(path.read_text(encoding="utf-8"))
+    ok("--force 跳过 remark、500 家和 70% 的检查，接受首台响应",
+       code == 0 and h.calls == [L.OVERPASS_SERVERS[0][0]] and len(built["elements"]) == 1)
 ok("搜索结果语言：网址带 /it/ 的算 other", L._item_lang("I 50 migliori ristoranti", "https://wanderlog.com/it/list/geoCategory/33205") == "other"
    and L._item_lang("Best Indian", "https://www.thefork.com/restaurants/x") == "en")
 
