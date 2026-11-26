@@ -43,7 +43,7 @@ import locallife_tools as L  # noqa: E402
 
 logger = logging.getLogger(__name__)
 
-AGENT_VERSION = "w5.5"  # 写进每个回答的 json，评测报告据此确认是哪个版本在作答
+AGENT_VERSION = "w5.6"  # 写进每个回答的 json，评测报告据此确认是哪个版本在作答
 LLM_CONFIG = "config/agent_llm_config.json"
 MAX_MESSAGES = 40
 TOP_N = 5                # 最多推荐几家
@@ -542,19 +542,22 @@ CITY_ONLY = {"birmingham", "birmingham city centre", "birmingham city center", "
              "the city centre", "town centre", "伯明翰", "伯明翰市中心", "市中心"}
 
 
+def _norm_location(text: str) -> str:
+    return " ".join(text.lower().split()).removeprefix("the ")
+
+
 def node_locate(state: AgentState) -> Dict[str, Any]:
     slots, lang = state["slots"], state["lang"]
     notes, degraded = list(state.get("notes") or []), list(state.get("degraded") or [])
     text = slots.get("location") or ""
+    last = state.get("last_place") or {}
+    last_text = (state.get("last_slots") or {}).get("location") or ""
+    if last and (not text or _norm_location(text) == _norm_location(last_text)):
+        notes.append(_t("prev_loc", lang, name=last["name"]))
+        return {"place": dict(last, origin="previous"), "notes": notes}
     if not text:
-        last = state.get("last_place") or {}
-        if last:
-            place = dict(last, origin="previous")
-            notes.append(_t("prev_loc", lang, name=last["name"]))
-        else:
-            place = dict(DEFAULT_PLACE)
-            notes.append(_t("default_loc", lang))
-        return {"place": place, "notes": notes}
+        notes.append(_t("default_loc", lang))
+        return {"place": dict(DEFAULT_PLACE), "notes": notes}
     if _norm(text) in CITY_ONLY:
         return {"place": dict(DEFAULT_PLACE, origin="city"), "notes": notes}  # 只说了「伯明翰」：按市中心、全城范围
     try:

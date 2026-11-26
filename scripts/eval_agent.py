@@ -34,7 +34,7 @@ def split_reply(content):
     return content.split("```json")[0].strip(), payload
 
 
-ENV_FALLBACK = {"map_snapshot", "map_unavailable"}  # 没注入故障且只有地图降级时，属于环境波动
+ENV_FALLBACK = {"map_snapshot", "map_unavailable", "geocode_offline"}  # 未注入故障的地图、定位降级
 
 
 def env_fallback(case, js):
@@ -57,8 +57,10 @@ def check(exp, text, js, env=False):
         if not re.search(r"can['’]t check distances|没法算距离", body, re.I):
             bad.append("地图完全不可用时，正文没有说明无法计算距离")
     else:
-        if "status" in exp and js.get("status") not in exp["status"] and not (env and "ok" in exp["status"]):
-            bad.append(f"status={js.get('status')}，期望 {exp['status']}")
+        status = js.get("status")
+        expected_statuses = exp.get("status", [status])
+        if status not in expected_statuses and not (env and status == "degraded" and "ok" in expected_statuses):
+            bad.append(f"status={status}，期望 {expected_statuses}")
         if "min_shops" in exp and len(shops) < exp["min_shops"]:
             bad.append(f"门店 {len(shops)} < {exp['min_shops']}")
     if "min_sources" in exp and len(srcs) < exp["min_sources"]:
@@ -159,9 +161,7 @@ def main():
             rows.append(row)
             jl.write(json.dumps(row, ensure_ascii=False) + "\n")
             v = js.get("verify") or {}
-            env_note = ""
-            if env:
-                env_note = "（环境波动，地图完全不可用）" if "map_unavailable" in js["degraded"] else "（环境波动，走了快照）"
+            env_note = f"（环境波动，{'、'.join(js['degraded'])}）" if env else ""
             print(f"{'✓' if not bad else '✗'} {c['id']:4} {js.get('status', '-'):15} 店 {len(js.get('shops') or []):>2} "
                   f"源 {len(js.get('sources') or []):>2} 核对 {'模板' if v.get('templated') else v.get('attempts', '-')}"
                   f"  {row['seconds']:>5} 秒  {env_note}{'；'.join(bad)}")
@@ -192,7 +192,7 @@ def main():
              f"- 时间：英国 {L.london_now():%Y-%m-%d %H:%M}；版本：{A.AGENT_VERSION}；用例集：{os.path.basename(args.set)}",
              f"- 通过：**{passed}/{len(rows)}**",
              f"- 推荐类回答 {len(rec)} 条：重写过 {retried} 条，改用模板 {templ} 条",
-             f"- 环境波动 {sum(r['env'] for r in rows)} 条（未注入故障，且仅发生地图降级）",
+             f"- 环境波动 {sum(r['env'] for r in rows)} 条（未注入故障，且仅发生地图或定位降级）",
              f"- 在线地图成功 {map_counts['online']} 条，按计划用快照 {map_counts['planned']} 条，"
              f"因故障转快照 {map_counts['fallback']} 条，地图完全不可用 {map_counts['unavailable']} 条",
              f"- 单轮耗时（最后一轮）：中位 {p50 / 1000:.1f} 秒，P90 {p90 / 1000:.1f} 秒", "",

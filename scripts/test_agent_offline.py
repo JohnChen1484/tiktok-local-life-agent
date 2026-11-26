@@ -20,6 +20,7 @@ from langgraph.checkpoint.memory import MemorySaver  # noqa: E402
 
 import locallife_tools as L  # noqa: E402
 from agents import agent as A  # noqa: E402
+import eval_agent as E  # noqa: E402
 
 PASS = FAIL = 0
 
@@ -34,14 +35,16 @@ def ok(name, cond):
 # ---------------------------------------------------------------- 假工具
 PLACES = {
     "new street": L.Place("Birmingham New Street", 52.4776, -1.8987, "photon", city="Birmingham", country="United Kingdom"),
+    "bullring": L.Place("Bullring", 52.4774, -1.8936, "photon", city="Birmingham"),
     "the mailbox": L.Place("The Mailbox", 52.4755, -1.9033, "photon", city="Birmingham", country="United Kingdom"),
     "mailbox": L.Place("The Mailbox", 52.4755, -1.9033, "photon", city="Birmingham", country="United Kingdom"),
     "manchester city centre": L.Place("Manchester city centre", 53.48, -2.24, "photon", city="Manchester"),
 }
-GEO_FAULT = {"mode": ""}
+GEO_FAULT = {"mode": "", "calls": []}
 
 
 def fake_geocode(text, **_):
+    GEO_FAULT["calls"].append(text)
     low = text.lower().strip()
     if GEO_FAULT["mode"] == "down":
         raise L.ToolError("TIMEOUT", "fake down")
@@ -153,7 +156,7 @@ def run(graph, text, thread="t"):
 def reset(map_mode="ok", search_mode="ok", geo="", search_items=None):
     MAP.update(mode=map_mode, calls=[])
     SEARCH.update(mode=search_mode, calls=[], items=search_items)
-    GEO_FAULT["mode"] = geo
+    GEO_FAULT.update(mode=geo, calls=[])
     LLM.update(drafts=[], parse_fail=False, calls=[], answer_prompts=[])
     A._SEARCH_CACHE.clear()
 
@@ -164,7 +167,7 @@ g = A.build_agent(checkpointer=MemorySaver())
 reset()
 LLM["parse"]["Indian food near New Street"] = slots(location="New Street", keywords=["indian", "curry"], category="restaurant")
 text, js = run(g, "Indian food near New Street", "n1")
-ok("正常推荐：status ok、版本号 w5.5、3+ 家、位置来自用户", js["status"] == "ok" and js["version"] == A.AGENT_VERSION == "w5.5"
+ok("正常推荐：status ok、版本号 w5.6、3+ 家、位置来自用户", js["status"] == "ok" and js["version"] == A.AGENT_VERSION == "w5.6"
    and len(js["shops"]) >= 3 and js["location"]["origin"] == "user")
 ok("口味关键词和类别传给地图工具", MAP["calls"][0]["keywords"] == ["indian", "curry"] and MAP["calls"][0]["amenities"] == A.CATEGORY_AMENITIES["restaurant"])
 ok("注入内容、过时、别的城市的搜索结果都没进来源", js["search"]["dropped_suspicious"] == 1 and js["search"]["stale"] == 1
@@ -279,6 +282,21 @@ LLM["parse"]["Coffee near the Bullring"] = slots(location="the Bullring", catego
 text, js = run(g, "Coffee near the Bullring", "n9")
 ok("定位服务故障 → 内置地标兜底（degraded）", js["status"] == "degraded" and "geocode_offline" in js["degraded"]
    and js["location"]["source"] == "builtin")
+expect = {"status": ["ok"], "min_shops": 1}
+ok("自然定位降级算环境波动，允许 degraded 满足 ok 的状态要求",
+   E.env_fallback({}, js) and not E.check(expect, text, js, env=E.env_fallback({}, js)))
+ok("环境波动允许定位和地图降级并存，故障注入和搜索降级仍按常规判定",
+   E.env_fallback({}, dict(js, degraded=["geocode_offline", "map_snapshot"]))
+   and not E.env_fallback({"fault": "geocode_down"}, js)
+   and not E.env_fallback({}, dict(js, degraded=["geocode_offline", "search_unavailable"]))
+   and any("status=degraded" in msg for msg in E.check(expect, text, js)))
+empty = dict(js, status="no_results", shops=[])
+ok("定位降级后真的没门店，期望 ok 的用例仍会失败",
+   E.env_fallback({}, empty) and any("status=no_results" in msg for msg in E.check(expect, text, empty, env=True)))
+map_down = dict(js, status="error", degraded=["geocode_offline", "map_unavailable"], shops=[])
+ok("定位加地图完全不可用仍需在正文说明无法算距离",
+   E.env_fallback({}, map_down) and not E.check(expect, "I can't check distances.", map_down, env=True)
+   and bool(E.check(expect, "Here are some places.", map_down, env=True)))
 reset(geo="down")
 LLM["parse"]["Coffee near Leeds station"] = slots(location="Leeds station", category="cafe")
 text, js = run(g, "Coffee near Leeds station", "n10")
@@ -424,7 +442,17 @@ ok("追问换位置：类别沿用上一轮（cafe），位置换成 Mailbox", j
 LLM["parse"]["Which of those are open now?"] = {"intent": "followup", "location": "", "keywords": [], "open_now": True}
 text, js = run(g, "Which of those are open now?", "m1")
 ok("再追问「现在营业」：位置沿用 Mailbox、加上营业筛选", js["location"]["name"] == "The Mailbox" and js["request"]["open_now"]
-   and js["location"]["origin"] == "previous")
+   and js["location"]["origin"] == "previous" and GEO_FAULT["calls"] == ["New Street", "the Mailbox"])
+
+reset()
+LLM["parse"]["Coffee near the Bullring"] = slots(location="Bullring", category="cafe")
+_, first = run(g, "Coffee near the Bullring", "m02")
+LLM["parse"]["Which of those are open now?"] = slots(intent="followup", location="  THE   Bullring  ", open_now=True)
+text, js = run(g, "Which of those are open now?", "m02")
+ok("M02 模型带回同一地点时复用上一轮坐标，第二轮不再调用 geocode",
+   first["location"]["origin"] == "user" and GEO_FAULT["calls"] == ["Bullring"]
+   and js["location"] == dict(first["location"], origin="previous")
+   and js["request"]["open_now"] and text.startswith("_Still searching near Bullring"))
 
 # ---- 8 安全与闲聊
 reset()

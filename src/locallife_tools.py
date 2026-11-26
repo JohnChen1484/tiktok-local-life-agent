@@ -25,6 +25,10 @@ v5（2026-11-26 实测后）：
 
 v5.5：程序端关键词仅匹配单词开头，门店保留饮食标签的 yes/only 状态。
 
+v5.6：
+  - 在线定位总时限为 6 秒，Photon 超时或报错后暂时熔断。
+  - 查询含 station 而 Photon 的英国候选里没有火车站时，优先使用匹配的内置地标。
+
 所有失败都抛 ToolError(code, message)，由工作流决定重试、降级还是追问用户，不让模型自己猜。
 设置环境变量 LL_FAULT 可以人为制造故障，用于评测异常分支，例如：
   LL_FAULT=overpass_down,search_down   多个用逗号分隔，取值见 FAULTS。
@@ -63,6 +67,11 @@ PHOTON_URL = "https://photon.komoot.io/api/"
 POSTCODES_URL = "https://api.postcodes.io"
 
 NEARBY_BUDGET = 15.0  # 整个周边查询（所有服务器加起来）的时限，秒；超了就转快照
+GEOCODE_BUDGET = 6.0  # 单次定位请求的总时限，秒
+
+# Photon 和 Overpass 共用熔断表，每个服务按网址单独计时。
+CIRCUIT_SECONDS = 300
+_DOWN_UNTIL: Dict[str, float] = {}
 
 WALK_SPEED_M_PER_MIN = 80.0
 ROUTE_FACTOR = 1.3  # 街道绕行：直线距离 × 1.3 ≈ 步行距离（估算）
@@ -166,9 +175,13 @@ _MINOR_FEATURES = {"footway", "path", "steps", "corridor", "service", "platform"
                    "ferry_terminal", "stop_area"}
 
 
-def _cand_rank(c: Dict[str, Any], text: str) -> int:
+def _is_train_station(c: Dict[str, Any]) -> bool:
+    return c["osm_value"] in ("station", "halt") and c["osm_key"] in ("railway", "public_transport", "building")
+
+
+def _cand_rank(c: Dict[str, Any], station_query: bool) -> int:
     rank = 0
-    if "station" in text.lower() and c["osm_value"] in ("station", "halt") and c["osm_key"] in ("railway", "public_transport", "building"):
+    if station_query and _is_train_station(c):
         rank -= 2
     if c["osm_value"] in _MINOR_FEATURES:
         rank += 1
@@ -188,11 +201,19 @@ def geocode(text: str, *, http: Callable[..., Any] = _http_json) -> Place:
     if "geocode_down" in _faults():
         raise ToolError("TIMEOUT", "人为故障：geocode_down")
 
+    deadline = time.monotonic() + GEOCODE_BUDGET
+
+    def fetch(url: str) -> Any:
+        left = deadline - time.monotonic()
+        if left <= 0:
+            raise ToolError("TIMEOUT", "在线定位的总时限已用完")
+        return _with_deadline(lambda: http(url, timeout=left), left)
+
     m = _POSTCODE_RE.search(text)
     if m:
         pc = f"{m.group(1)} {m.group(2)}".upper()
         try:
-            r = http(f"{POSTCODES_URL}/postcodes/{urllib.parse.quote(pc)}")
+            r = fetch(f"{POSTCODES_URL}/postcodes/{urllib.parse.quote(pc)}")
         except ToolError as exc:
             if exc.code == "HTTP_404":
                 raise ToolError("LOCATION_NOT_FOUND", f"邮编 {pc} 不存在") from exc
@@ -204,7 +225,7 @@ def geocode(text: str, *, http: Callable[..., Any] = _http_json) -> Place:
     if m:
         oc = m.group(1).upper()
         try:
-            r = http(f"{POSTCODES_URL}/outcodes/{urllib.parse.quote(oc)}")
+            r = fetch(f"{POSTCODES_URL}/outcodes/{urllib.parse.quote(oc)}")
         except ToolError as exc:
             if exc.code == "HTTP_404":
                 raise ToolError("LOCATION_NOT_FOUND", f"邮编区 {oc} 不存在") from exc
@@ -217,9 +238,20 @@ def geocode(text: str, *, http: Callable[..., Any] = _http_json) -> Place:
     # 先不限范围搜（只偏向伯明翰）：排第一的在英国以外，就说明用户说的是境外地点。
     # 实测教训：一开始就限定英国范围的话，境外地点（实测用的是一个中国景点）会被硬匹配成
     # 西米德兰兹名字相近的公园湖。
+    if time.time() < _DOWN_UNTIL.get(PHOTON_URL, 0):
+        raise ToolError("TIMEOUT", "Photon 近期请求失败，暂时跳过在线定位")
     lat0, lon0 = DEFAULT_CENTER
     params = {"q": text, "limit": "8", "lang": "en", "lat": str(lat0), "lon": str(lon0)}
-    feats = (http(f"{PHOTON_URL}?{urllib.parse.urlencode(params)}") or {}).get("features") or []
+    try:
+        data = fetch(f"{PHOTON_URL}?{urllib.parse.urlencode(params)}")
+        if not isinstance(data, dict) or not isinstance(data.get("features"), list):
+            raise ToolError("BAD_RESPONSE", "Photon 响应缺少有效的 features 列表")
+        feats = data["features"]
+    except ToolError:
+        _DOWN_UNTIL[PHOTON_URL] = time.time() + CIRCUIT_SECONDS
+        raise
+    if time.time() >= _DOWN_UNTIL.get(PHOTON_URL, 0):
+        _DOWN_UNTIL.pop(PHOTON_URL, None)
     if not feats:
         raise ToolError("LOCATION_NOT_FOUND", f"找不到 {text}")
     top_lon, top_lat = feats[0]["geometry"]["coordinates"]
@@ -237,9 +269,11 @@ def geocode(text: str, *, http: Callable[..., Any] = _http_json) -> Place:
     cands = [as_cand(f) for f in feats if _in_uk(f["geometry"]["coordinates"][1], f["geometry"]["coordinates"][0])]
     if not cands:
         raise ToolError("OUT_OF_COVERAGE", f"{text} 不在英国")
-    cands.sort(key=lambda c: _cand_rank(c, text))  # 稳定排序：同分保持 Photon 原顺序
+    station_query = "station" in text.lower()
+    cands.sort(key=lambda c: _cand_rank(c, station_query))  # 稳定排序：同分保持 Photon 原顺序
     top = cands[0]
-    if top["osm_value"] in _MINOR_FEATURES:
+    missing_station = station_query and not any(_is_train_station(c) for c in cands)
+    if missing_station or top["osm_value"] in _MINOR_FEATURES:
         landmark = geocode_offline(text)
         if landmark is not None:
             return landmark
@@ -250,7 +284,7 @@ def geocode(text: str, *, http: Callable[..., Any] = _http_json) -> Place:
                  ambiguous=bool(other_cities) and not named_city and top["city"] != DEFAULT_CITY)
 
 
-# 定位服务不可用或首选为次要要素时可用：伯明翰常见地标的近似坐标（误差约 100–300 米），来源标 builtin
+# 伯明翰常见地标的近似坐标（误差约 100–300 米），来源标 builtin
 LANDMARKS: Dict[str, Tuple[str, float, float]] = {
     "new street": ("Birmingham New Street", 52.4778, -1.8990),
     "grand central": ("Grand Central", 52.4776, -1.8987),
@@ -463,12 +497,6 @@ def _overpass_query(lat: float, lon: float, radius: int, amenities: Tuple[str, .
 def tag_text(tags: Dict[str, str]) -> str:
     """程序端匹配口味用的文本：店名 + 菜系 + 饮食标签。"""
     return f"{tags.get('name', '')} {tags.get('cuisine', '')} {' '.join(_diet_tags(tags))}"
-
-
-# 熔断：某台服务器超时或报错后，接下来 CIRCUIT_SECONDS 秒内直接跳过它。
-# 实测 mail.ru 会间歇性地连续几分钟没响应，不熔断的话，这段时间里每个请求都要白等 10–15 秒才转快照。
-CIRCUIT_SECONDS = 300
-_DOWN_UNTIL: Dict[str, float] = {}
 
 
 def _fetch_overpass(query: str, http: Callable[..., Any], budget: Optional[float] = None) -> Tuple[Dict[str, Any], str]:

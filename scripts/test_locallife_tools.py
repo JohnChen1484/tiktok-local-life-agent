@@ -85,9 +85,59 @@ except L.ToolError as exc:
     ok(f"英国以外 → OUT_OF_COVERAGE（{exc.detail.get('country')}）", exc.code == "OUT_OF_COVERAGE" and exc.detail.get("country") == "France")
 ok("哪都找不到 → LOCATION_NOT_FOUND", raises("LOCATION_NOT_FOUND", lambda: L.geocode("Qwxyzzz", http=fake_http({"photon": {"features": []}}))))
 ok("没给位置 → NO_LOCATION", raises("NO_LOCATION", lambda: L.geocode("  ")))
-os.environ["LL_FAULT"] = "geocode_down"
-ok("故障开关 geocode_down → TIMEOUT", raises("TIMEOUT", lambda: L.geocode("Bullring", http=fake_http({"photon": bull}))))
-os.environ["LL_FAULT"] = ""
+
+
+def slow_photon(url, data):
+    time.sleep(8)
+    return bull
+
+
+L._DOWN_UNTIL.clear()
+with patch.object(L, "CIRCUIT_SECONDS", 300):
+    h = fake_http({"photon": slow_photon, "/postcodes/": pc})
+    t0 = time.monotonic()
+    timed_out = raises("TIMEOUT", lambda: L.geocode("Bullring", http=h))
+    elapsed = time.monotonic() - t0
+    ok(f"Photon 的慢响应受 6 秒总时限限制（{elapsed:.1f} 秒）",
+       L.GEOCODE_BUDGET == 6 and timed_out and elapsed < 6.8 and L._DOWN_UNTIL.get(L.PHOTON_URL, 0) > time.time())
+    ok("Photon 熔断以服务网址为键，换一个地标也不发请求",
+       raises("TIMEOUT", lambda: L.geocode("New Street station", http=h)) and len(h.calls) == 1)
+    ok("Photon 熔断期间邮编定位仍可查询 postcodes.io", L.geocode("B1 1BB", http=h).postcode == "B1 1BB")
+
+    L._DOWN_UNTIL[L.PHOTON_URL] = time.time() - 1
+    h = fake_http({"photon": bull})
+    ok("Photon 熔断期结束后恢复请求", L.geocode("Bullring", http=h).source == "photon" and len(h.calls) == 1)
+
+    for code, response in (("HTTP_ERROR", L.ToolError("HTTP_ERROR", "502")), ("BAD_RESPONSE", {"unexpected": []})):
+        h = fake_http({"photon": response})
+        ok(f"Photon 报 {code} 后也跳过下一次请求",
+           raises(code, lambda: L.geocode("Bullring", http=h))
+           and raises("TIMEOUT", lambda: L.geocode("Bullring", http=h)) and len(h.calls) == 1)
+        L._DOWN_UNTIL.clear()
+    h = fake_http({"photon": {"features": []}})
+    ok("Photon 返回合法的空候选时不触发熔断",
+       raises("LOCATION_NOT_FOUND", lambda: L.geocode("Qwxyzzz", http=h)) and L.PHOTON_URL not in L._DOWN_UNTIL)
+
+    h = fake_http({"photon": bull})
+    with patch.dict(os.environ, {"LL_FAULT": "geocode_down"}):
+        ok("人为故障 geocode_down 返回 TIMEOUT，不发请求且不触发熔断",
+           raises("TIMEOUT", lambda: L.geocode("Bullring", http=h)) and not h.calls and L.PHOTON_URL not in L._DOWN_UNTIL)
+    ok("撤销 geocode_down 后可立即请求 Photon", L.geocode("Bullring", http=h).source == "photon" and len(h.calls) == 1)
+
+
+def slow_postcode(url, *, timeout):
+    postcode_calls.append((url, timeout))
+    time.sleep(1.0)
+    return pc
+
+
+postcode_calls = []
+with patch.object(L, "GEOCODE_BUDGET", 0.2):
+    for query, path in (("B1 1BB", "/postcodes/"), ("B1", "/outcodes/")):
+        t0 = time.monotonic()
+        timed_out = raises("TIMEOUT", lambda: L.geocode(query, http=slow_postcode))
+        ok(f"{path} 请求也受定位总时限限制", timed_out and time.monotonic() - t0 < 0.8 and postcode_calls
+           and path in postcode_calls[-1][0] and 0 < postcode_calls[-1][1] <= L.GEOCODE_BUDGET)
 
 # ---- 距离
 d = L.distance_m(52.4778, -1.8990, 52.4774, -1.8936)
@@ -241,10 +291,10 @@ p = L.geocode("Sorting Office", http=fake_http({"photon": {"features": nst["feat
 ok("只有人行道一个候选时照样返回", p.name.startswith("New Street Station Subway"))
 for text, osm_value, wrong_name in (
     ("Brindleyplace", "ferry_terminal", "Brindleyplace Water Bus Stop"),
-    ("Snow Hill station", "bus_stop", "Colmore Row opposite Snow Hill Station"),
-    ("Snow Hill station", "stop", "Snow Hill Stop"),
-    ("Snow Hill station", "tram_stop", "Snow Hill Tram Stop"),
-    ("Snow Hill station", "stop_area", "Snow Hill Stop Area"),
+    ("Snow Hill", "bus_stop", "Colmore Row opposite Snow Hill Station"),
+    ("Snow Hill", "stop", "Snow Hill Stop"),
+    ("Snow Hill", "tram_stop", "Snow Hill Tram Stop"),
+    ("Snow Hill", "stop_area", "Snow Hill Stop Area"),
 ):
     stop = feat(wrong_name, "Birmingham", 52.4820, -1.9025, osm_value=osm_value)
     p = L.geocode(text, http=fake_http({"photon": {"features": [stop]}}))
@@ -252,6 +302,26 @@ for text, osm_value, wrong_name in (
     landmark = feat(text, "Birmingham", 52.4830, -1.8980)
     p = L.geocode(text, http=fake_http({"photon": {"features": [stop, landmark]}}))
     ok(f"{osm_value} 排在普通 Photon 候选后面", p.source == "photon" and p.lat == 52.4830)
+
+snow_hill_query = "Snow Hill station"
+snow_hill_cands = [
+    feat(name, "Birmingham", 52.4820, -1.9010, osm_key=key, osm_value=value)
+    for name, key, value in (
+        ("Colmore Row opposite Snow Hill Station", "highway", "bus_stop"),
+        ("150th Anniversary of Snow Hill Station", "historic", "memorial"),
+        ("Snow Hill Police Station", "amenity", "police"),
+        ("Snow Hill Service Station", "shop", "vacant"),
+        ("Spar", "shop", "convenience"),
+        ("Sbarro", "amenity", "fast_food"),
+    )
+]
+p = L.geocode(snow_hill_query, http=fake_http({"photon": {"features": snow_hill_cands}}))
+ok("Snow Hill station 的实测候选均非火车站 → 返回内置地标坐标",
+   p.source == "builtin" and p == L.geocode_offline(snow_hill_query))
+station = feat("Birmingham Snow Hill", "Birmingham", 52.4837, -1.8994, osm_key="railway", osm_value="station")
+p = L.geocode(snow_hill_query, http=fake_http({"photon": {"features": [*snow_hill_cands, station]}}))
+ok("Snow Hill station 的候选中有火车站 → 返回 Photon 车站坐标",
+   p.source == "photon" and p.name == "Birmingham Snow Hill" and (p.lat, p.lon) == (52.4837, -1.8994))
 
 # ---- 快照优先、范围与故障分支
 snapshot_time = L.london_now()
