@@ -1,0 +1,4 @@
+# 本地跑离线测试用；扣子环境里已自带这些包
+langgraph>=1.0,<2
+langchain-core>=1.0,<2
+langchain-openai>=1.0,<2

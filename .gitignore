@@ -1,0 +1,11 @@
+.env
+.env.*
+*.key
+.venv/
+__pycache__/
+*.pyc
+reports/
+dist/
+*.zip
+assets/poi_snapshot.json
+.DS_Store
