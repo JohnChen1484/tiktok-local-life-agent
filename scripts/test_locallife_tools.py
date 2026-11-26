@@ -1,12 +1,19 @@
 """本地测试：不联网，用假的 http 函数模拟各服务的返回和故障。"""
+import io
+import json
 import os
 import sys
 import time
-from datetime import datetime
+from contextlib import redirect_stdout
+from datetime import datetime, timedelta
+from pathlib import Path
+from tempfile import TemporaryDirectory
 from types import SimpleNamespace
+from unittest.mock import patch
 
 sys.path.insert(0, os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "src"))
 import locallife_tools as L  # noqa: E402
+import build_poi_snapshot  # noqa: E402
 
 PASS = FAIL = 0
 # 测试不能受项目里真实快照和熔断状态影响（扣子里已经建了快照，第一版测试因此有 2 条在扣子里失败、本地通过）
@@ -54,8 +61,8 @@ oc = {"result": {"latitude": 52.47, "longitude": -1.89, "admin_district": ["Birm
 ok("只给邮编前半段 B5 → outcodes", L.geocode("B5", http=fake_http({"/outcodes/B5": oc})).postcode == "B5")
 
 
-def feat(name, city, lat, lon, country="United Kingdom"):
-    return {"properties": {"name": name, "city": city, "country": country}, "geometry": {"coordinates": [lon, lat]}}
+def feat(name, city, lat, lon, country="United Kingdom", **tags):
+    return {"properties": {"name": name, "city": city, "country": country, **tags}, "geometry": {"coordinates": [lon, lat]}}
 
 
 bull = {"features": [feat("Bullring", "Birmingham", 52.4774, -1.8936)]}
@@ -125,11 +132,40 @@ ok("同一口味再查走缓存", L.nearby(52.4778, -1.8990, radius=800, keyword
 q = L._overpass_query(52.4, -1.9, 800, ("restaurant",), ['indian"];out;', "x", "hot_pot"])
 ok("关键词清洗：去掉引号分号等，太短的丢掉；hot_pot 可匹配 Hot Pot / hotpot",
    '"];out;' not in q.split("[name]")[1][:-len("out center tags;")] and "indianout" in q and "hot[ _]?pot" in q)
-q = L._overpass_query(52.4, -1.9, 800, ("restaurant",), ["halal", "burger"])
-ok("清真/素食关键词：另查 diet:* 标签并取并集", q.count("nwr(") == 2 and '["diet:halal"~"^(yes|only)$"]' in q and q.startswith("[out:json][timeout:12];("))
-dt = {"osm3s": {}, "elements": [{"type": "node", "id": 8, "lat": 52.478, "lon": -1.899, "tags": {"name": "Grill House", "amenity": "restaurant", "diet:halal": "yes"}}]}
-L._CACHE.clear()
-ok("程序端也认 diet:halal=yes（快照兜底时靠这一步）", [x["name"] for x in L.nearby(52.4778, -1.899, keywords=["halal"], http=fake_http({"mail.ru": dt}))["shops"]] == ["Grill House"])
+diet_data = {"elements": [
+    {"type": "node", "id": i, "lat": 52.478, "lon": -1.899, "tags": {"amenity": "restaurant", **tags}}
+    for i, tags in enumerate((
+        {"name": "Grill House", "cuisine": "burger", "diet:halal": "only", "diet:vegan": "yes", "diet:vegetarian": "no"},
+        {"name": "Halal Burger Kitchen", "cuisine": "fast_food"},
+        {"name": "Burger Bar", "diet:halal": "no"},
+        {"name": "Halal Tandoori", "cuisine": "indian"},
+        {"name": "Plant Pizza", "cuisine": "pizza;vegan"},
+        {"name": "Plant Grill", "cuisine": "burger;vegan"},
+        {"name": "Soft Serve", "cuisine": "ice_cream", "diet:halal": "yes"},
+    ), 10)
+]}
+sent.clear()
+h = fake_http({"mail.ru": lambda url, data: (sent.append(data["data"]), diet_data)[1]})
+r = L.nearby(52.4778, -1.899, keywords=["burgers"], http=h)
+ok("burgers 在在线查询和程序端都能匹配单数 burger，短词 gas 保留末尾 s",
+   [s["name"] for s in r["shops"]] == ["Grill House", "Halal Burger Kitchen", "Burger Bar", "Plant Grill"]
+   and '[~"^(name|cuisine)$"~"burgers?",i]' in sent[-1] and L._kw_pattern(["gas"]) == "gas")
+r = L.nearby(52.4778, -1.899, keywords=["halal", "burgers"], http=h)
+ok("halal burgers：在线只查菜系，程序端同时要求汉堡和清真",
+   [s["name"] for s in r["shops"]] == ["Grill House", "Halal Burger Kitchen"]
+   and sent[-1].count("nwr(") == 1 and '[~"^(name|cuisine)$"~"burgers?",i]' in sent[-1]
+   and "halal" not in sent[-1])
+ok("diet 字段只收录 yes/only 的标签，无标签时为空",
+   {s["name"]: s["diet"] for s in r["shops"]} == {"Grill House": "vegan;halal", "Halal Burger Kitchen": ""})
+r = L.nearby(52.4778, -1.899, keywords=["halal", "vegan", "burger"], http=h)
+ok("同时指定菜系和多个饮食关键词时，每项饮食条件都须满足",
+   [s["name"] for s in r["shops"]] == ["Grill House"])
+r = L.nearby(52.4778, -1.899, keywords=["halal", "vegan"], http=h)
+ok("只有饮食关键词时，在线和程序端都按名称、菜系和 diet:* 标签取并集",
+   [s["name"] for s in r["shops"]] == ["Grill House", "Halal Burger Kitchen", "Halal Tandoori",
+                                      "Plant Pizza", "Plant Grill", "Soft Serve"]
+   and sent[-1].count("nwr(") == 3 and '[~"^(name|cuisine)$"~"halal|vegan",i]' in sent[-1]
+   and all(f'["diet:{d}"~"^(yes|only)$"]' in sent[-1] for d in ("halal", "vegan")))
 hp = {"osm3s": {}, "elements": [{"type": "node", "id": 7, "lat": 52.478, "lon": -1.899, "tags": {"name": "Happy Lamb Hot Pot", "amenity": "restaurant", "cuisine": "chinese"}}]}
 L._CACHE.clear()
 ok("hot_pot 关键词在程序端也能匹配「Hot Pot」", [x["name"] for x in L.nearby(52.4778, -1.899, keywords=["hot_pot"], http=fake_http({"mail.ru": hp}))["shops"]] == ["Happy Lamb Hot Pot"])
@@ -184,20 +220,84 @@ p = L.geocode("New Street station", http=fake_http({"photon": nst}))
 ok("说了 station → 优先车站本身，地下通道往后排", p.name == "Birmingham New Street")
 p = L.geocode("Sorting Office", http=fake_http({"photon": {"features": nst["features"][:1]}}))
 ok("只有人行道一个候选时照样返回", p.name.startswith("New Street Station Subway"))
+for text, osm_value, wrong_name in (
+    ("Brindleyplace", "ferry_terminal", "Brindleyplace Water Bus Stop"),
+    ("Snow Hill station", "bus_stop", "Colmore Row opposite Snow Hill Station"),
+    ("Snow Hill station", "stop", "Snow Hill Stop"),
+    ("Snow Hill station", "tram_stop", "Snow Hill Tram Stop"),
+    ("Snow Hill station", "stop_area", "Snow Hill Stop Area"),
+):
+    stop = feat(wrong_name, "Birmingham", 52.4820, -1.9025, osm_value=osm_value)
+    p = L.geocode(text, http=fake_http({"photon": {"features": [stop]}}))
+    ok(f"{text} 的首选是次要要素 {osm_value} → 使用内置地标坐标", p.source == "builtin" and p == L.geocode_offline(text))
+    landmark = feat(text, "Birmingham", 52.4830, -1.8980)
+    p = L.geocode(text, http=fake_http({"photon": {"features": [stop, landmark]}}))
+    ok(f"{osm_value} 排在普通 Photon 候选后面", p.source == "photon" and p.lat == 52.4830)
 
-# ---- 大范围、不限口味：直接用当天快照（实测在线 15 秒以上）
-today_snap = {"center": [52.4778, -1.8990], "radius": 4000, "data_time": L.london_now().strftime("%Y-%m-%dT%H:%M:%SZ"),
-              "elements": [{"type": "node", "id": 1, "lat": 52.4790, "lon": -1.8995, "tags": {"name": "Shababs Balti", "amenity": "restaurant"}}]}
+# ---- 快照优先、范围与故障分支
+snapshot_time = L.london_now()
+today_snap = {"center": [52.4778, -1.8990], "radius": 6000, "data_time": snapshot_time.isoformat(),
+              "elements": elements["elements"][:1]}
 L._CACHE.clear()
 h = fake_http({"mail.ru": elements})
-r = L.nearby(52.4778, -1.8990, radius=1500, http=h, snapshot=today_snap)
-ok("不限口味且半径 ≥1500 → 直接用当天快照，不访问在线服务器", r["from_snapshot"] and r["snapshot_planned"] and not h.calls)
-r = L.nearby(52.4778, -1.8990, radius=1500, keywords=["pizza"], http=h, snapshot=today_snap)
-ok("带口味的查询仍走在线（结果少、速度快）", not r["from_snapshot"] and len(h.calls) == 1)
-old_snap = dict(today_snap, data_time="2026-01-01T00:00:00Z")
+r = L.nearby(52.4778, -1.8990, radius=800, http=h, snapshot=today_snap)
+ok("半径 800 米也优先用覆盖范围的新快照", r["from_snapshot"] and r["snapshot_planned"] and not h.calls)
+diet_snap = dict(today_snap, elements=diet_data["elements"])
+r = L.nearby(52.4778, -1.8990, keywords=["halal", "burgers"], http=h, snapshot=diet_snap)
+ok("带口味的 800 米查询也直接用新快照，保留混合条件和饮食标签",
+   r["snapshot_planned"] and not h.calls
+   and {s["name"]: s["diet"] for s in r["shops"]} == {"Grill House": "vegan;halal", "Halal Burger Kitchen": ""})
+on_limit = dict(today_snap, data_time=(snapshot_time - timedelta(days=L.PLANNED_SNAPSHOT_MAX_AGE)).isoformat(), elements=[])
+r = L.nearby(52.4778, -1.8990, http=h, snapshot=on_limit)
+ok("覆盖范围内的空快照仍优先使用，允许恰好达到天数上限",
+   r["snapshot_planned"] and r["shops"] == [] and not h.calls)
+old_snap = dict(today_snap, data_time=(snapshot_time - timedelta(days=L.PLANNED_SNAPSHOT_MAX_AGE + 1)).isoformat())
+r = L.nearby(52.4778, -1.8990, http=h, snapshot=old_snap)
+ok("快照超过天数上限就走在线", not r["from_snapshot"] and len(h.calls) == 1)
+r = L.nearby(52.4778, -1.8990, http=h, snapshot=today_snap)
+ok("已有在线缓存时也优先用新快照", r["snapshot_planned"] and not r["cached"] and len(h.calls) == 1)
+
 L._CACHE.clear()
-r = L.nearby(52.4778, -1.8990, radius=1500, http=h, snapshot=old_snap)
-ok("快照超过 2 天就不优先用", not r["from_snapshot"])
+h = fake_http({"private.coffee": elements})
+os.environ["LL_FAULT"] = "overpass_slow"
+r = L.nearby(52.4778, -1.8990, http=h, snapshot=today_snap)
+ok("overpass_slow 跳过新快照，切到第二台在线服务器",
+   not r["snapshot_planned"] and r["server"] == L.OVERPASS_SERVERS[1][0] and h.calls == [r["server"]])
+L._CACHE.clear()
+os.environ["LL_FAULT"] = "search_down, overpass_down"
+r = L.nearby(52.4778, -1.8990, http=h, snapshot=today_snap)
+ok("overpass_down 跳过新快照优先，失败后用同一快照兜底",
+   r["from_snapshot"] and not r["snapshot_planned"] and "overpass_down" in r["fallback_reason"])
+os.environ["LL_FAULT"] = "search_down, overpass_future"
+h = fake_http({"mail.ru": elements})
+r = L.nearby(52.4778, -1.8990, http=h, snapshot=today_snap)
+ok("任何 overpass_ 前缀的故障都跳过快照优先", not r["from_snapshot"] and len(h.calls) == 1)
+os.environ["LL_FAULT"] = "search_down"
+r = L.nearby(52.4778, -1.8990, http=h, snapshot=today_snap)
+ok("仅有搜索故障时仍优先使用新快照", r["snapshot_planned"] and len(h.calls) == 1)
+os.environ["LL_FAULT"] = ""
+
+L._CACHE.clear()
+h = fake_http({"mail.ru": {"elements": []}})
+r = L.nearby(53.48, -2.24, http=h, snapshot=today_snap)
+ok("Manchester 超出 6 公里快照范围，仍走在线", not r["from_snapshot"] and h.calls == [r["server"]])
+h = fake_http({"mail.ru": elements})
+r = L.nearby_expanding(52.4778, -1.8990, radii=(800, 1500), min_results=2, http=h,
+                       snapshot=dict(today_snap, radius=1000))
+ok("先主动用快照，扩大半径超出覆盖时仍走在线",
+   r["tried_radii"] == [800, 1500] and not r["from_snapshot"] and len(r["shops"]) == 2 and len(h.calls) == 1)
+
+# ---- 快照构建，模拟在线响应，只写临时文件
+sent.clear()
+h = fake_http({"mail.ru": lambda url, data: (sent.append(data["data"]), diet_data)[1]})
+with TemporaryDirectory() as tmp:
+    path = Path(tmp) / "poi_snapshot.json"
+    with patch.object(sys, "argv", ["build_poi_snapshot.py"]), patch.object(L, "SNAPSHOT_PATH", str(path)), \
+         patch.object(L, "_http_json", h), redirect_stdout(io.StringIO()):
+        build_poi_snapshot.main()
+    built = json.loads(path.read_text(encoding="utf-8"))
+ok("快照构建默认请求 6000 米，写入的快照保留饮食标签",
+   built["radius"] == 6000 and "around:6000," in sent[0] and built["elements"][0]["tags"]["diet:halal"] == "only")
 ok("搜索结果语言：网址带 /it/ 的算 other", L._item_lang("I 50 migliori ristoranti", "https://wanderlog.com/it/list/geoCategory/33205") == "other"
    and L._item_lang("Best Indian", "https://www.thefork.com/restaurants/x") == "en")
 
@@ -236,9 +336,11 @@ L.NEARBY_BUDGET = 2.5
 L.OVERPASS_SERVERS = [("https://maps.mail.ru/x", 2.0), ("https://overpass.private.coffee/x", 2.0)]
 L._CACHE.clear()
 t0 = time.time()
-r = L.nearby(52.4778, -1.8990, http=lambda url, data=None, timeout=10: slow(url) if "mail.ru" in url else slow(url), snapshot={
-    "center": [52.4778, -1.8990], "radius": 4000, "data_time": "2026-11-25T22:00:00Z", "elements": []})
-ok(f"整个周边查询有总时限，用完就转快照（{time.time() - t0:.1f} 秒，时限 2.5 秒）", r["from_snapshot"] and time.time() - t0 < 3.5)
+h = fake_http({"mail.ru": slow, "private.coffee": slow})
+r = L.nearby(52.4778, -1.8990, http=h, snapshot=dict(old_snap, elements=[]))
+ok(f"整个周边查询有总时限，用完就转快照（{time.time() - t0:.1f} 秒，时限 2.5 秒）",
+   r["from_snapshot"] and not r["snapshot_planned"] and "TIMEOUT" in r["fallback_reason"]
+   and len(h.calls) == 1 and time.time() - t0 < 3.5)
 L.OVERPASS_SERVERS, L.NEARBY_BUDGET = old_servers, old_budget
 
 # ---- 搜索
@@ -275,16 +377,16 @@ for fault, check in [("search_down", lambda: raises("SEARCH_FAILED", lambda: L.s
 os.environ["LL_FAULT"] = ""
 
 # ---- 离线快照兜底
-snap = {"center": [52.4778, -1.8990], "radius": 4000, "data_time": "2026-11-25T22:00:00Z", "elements": [
+snap = dict(old_snap, elements=[
     {"type": "node", "id": 1, "lat": 52.4790, "lon": -1.8995, "tags": {"name": "Shababs Balti", "amenity": "restaurant", "cuisine": "indian;pakistani"}},
     {"type": "node", "id": 2, "lat": 52.4400, "lon": -1.9400, "tags": {"name": "Selly Oak Pizza", "amenity": "restaurant"}},
-    {"type": "node", "id": 3, "lat": 52.4780, "lon": -1.8990, "tags": {"name": "Some Pharmacy", "amenity": "pharmacy"}}]}
+    {"type": "node", "id": 3, "lat": 52.4780, "lon": -1.8990, "tags": {"name": "Some Pharmacy", "amenity": "pharmacy"}}])
 L._CACHE.clear()
 down = fake_http({"mail.ru": L.ToolError("TIMEOUT", "x"), "private.coffee": L.ToolError("TIMEOUT", "y")})
 r = L.nearby(52.4778, -1.8990, radius=800, http=down, snapshot=snap)
 ok(f"在线服务器全失败 → 用快照（{[x['name'] for x in r['shops']]}），标明来源和数据时间",
    r["from_snapshot"] and r["server"] == "snapshot" and [x["name"] for x in r["shops"]] == ["Shababs Balti"]
-   and r["data_time"].startswith("2026-11-25") and "TIMEOUT" in r["fallback_reason"])
+   and not r["snapshot_planned"] and r["data_time"] == old_snap["data_time"] and "TIMEOUT" in r["fallback_reason"])
 ok("快照结果不写进缓存（服务器恢复后马上用新数据）", not L._CACHE)
 ok("查询范围超出快照覆盖 → 仍报 MAP_UNAVAILABLE", raises("MAP_UNAVAILABLE", lambda: L.nearby(52.20, -1.70, radius=800, http=down, snapshot=snap)))
 ok("在线链路不再包含满载的主站", all("overpass-api.de" not in u for u, _ in L.OVERPASS_SERVERS))

@@ -1,7 +1,7 @@
 """TikTok 本地生活推荐（英国，默认伯明翰）的地图与搜索工具。
 
 位置查询：英国邮编 → postcodes.io；地标/地址 → Photon（OpenStreetMap 数据）。
-周边门店：Overpass（OpenStreetMap），多个服务器依次尝试，结果在进程内缓存。
+周边门店：优先用覆盖查询范围的新鲜快照；需要在线查询时依次尝试 Overpass 服务器，在线结果在进程内缓存。
 距离计算：程序按经纬度算直线距离，步行时间按路网绕行系数估算（标明「估算」）。
 热门榜单/优惠：平台联网搜索（coze_coding_dev_sdk.SearchClient）——TikTok 没有开放本地门店数据接口，
   TikTok 上的爆款门店、本地榜单和优惠套餐只能从公开网页搜索，按发布时间判断新旧。
@@ -16,6 +16,12 @@ v4（2026-11-25 实测后）：
   - 搜索结果标出是否提到城市（relevant）、是否与 TikTok 相关（tiktok）、语言（lang）；
     mentions() 按店名把搜索结果和地图门店对上，作为「热度」信号。
   - 定位服务不可用时，geocode_offline() 用内置的伯明翰常见地标坐标兜底（近似坐标，来源标 builtin）。
+
+v5（2026-11-26 实测后）：
+  - 覆盖查询范围且数据足够新的快照优先使用；Overpass 故障开关继续走原有在线和兜底链路。
+  - 公交站等次要定位候选往后排；首选仍为次要要素时，优先使用匹配的内置地标。
+  - 复数关键词可匹配单数；菜系与饮食条件同时出现时取交集，门店结果带 diet 字段。
+  - 周边查询支持指定关键词上限，供甜品默认查询使用全部 9 个词。
 
 所有失败都抛 ToolError(code, message)，由工作流决定重试、降级还是追问用户，不让模型自己猜。
 设置环境变量 LL_FAULT 可以人为制造故障，用于评测异常分支，例如：
@@ -135,7 +141,7 @@ class Place:
     name: str
     lat: float
     lon: float
-    source: str                  # postcodes.io / photon
+    source: str                  # postcodes.io / photon / builtin
     city: str = ""
     country: str = ""
     postcode: str = ""
@@ -154,7 +160,8 @@ def _in_uk(lat: float, lon: float) -> bool:
 # 实测：「New Street station」排第一的是车站地下通道（footway），坐标偏了 200 米。
 # 用户说「station」时优先车站本身；人行道、台阶、站台、入口这类要素一律往后排。
 _MINOR_FEATURES = {"footway", "path", "steps", "corridor", "service", "platform", "entrance", "subway_entrance",
-                   "stop_position", "pedestrian", "cycleway", "track"}
+                   "stop_position", "pedestrian", "cycleway", "track", "bus_stop", "stop", "tram_stop",
+                   "ferry_terminal", "stop_area"}
 
 
 def _cand_rank(c: Dict[str, Any], text: str) -> int:
@@ -230,6 +237,10 @@ def geocode(text: str, *, http: Callable[..., Any] = _http_json) -> Place:
         raise ToolError("OUT_OF_COVERAGE", f"{text} 不在英国")
     cands.sort(key=lambda c: _cand_rank(c, text))  # 稳定排序：同分保持 Photon 原顺序
     top = cands[0]
+    if top["osm_value"] in _MINOR_FEATURES:
+        landmark = geocode_offline(text)
+        if landmark is not None:
+            return landmark
     named_city = any(c.lower() in text.lower() for c in {x["city"] for x in cands if x["city"]})
     other_cities = [c for c in cands[1:] if c["city"] and c["city"] != top["city"]]
     return Place(name=top["name"], lat=top["lat"], lon=top["lon"], source="photon", city=top["city"],
@@ -237,7 +248,7 @@ def geocode(text: str, *, http: Callable[..., Any] = _http_json) -> Place:
                  ambiguous=bool(other_cities) and not named_city and top["city"] != DEFAULT_CITY)
 
 
-# 定位服务不可用时的兜底：伯明翰常见地标的近似坐标（误差约 100–300 米），来源标 builtin
+# 定位服务不可用或首选为次要要素时可用：伯明翰常见地标的近似坐标（误差约 100–300 米），来源标 builtin
 LANDMARKS: Dict[str, Tuple[str, float, float]] = {
     "new street": ("Birmingham New Street", 52.4778, -1.8990),
     "grand central": ("Grand Central", 52.4776, -1.8987),
@@ -271,7 +282,7 @@ LANDMARKS: Dict[str, Tuple[str, float, float]] = {
 
 
 def geocode_offline(text: str) -> Optional[Place]:
-    """在线定位全部失败时，用内置地标表匹配；匹配不到返回 None（由工作流请用户稍后重试）。"""
+    """用内置地标表匹配位置；匹配不到返回 None。"""
     low = (text or "").lower()
     for key in sorted(LANDMARKS, key=len, reverse=True):  # 长的先匹配：「library of birmingham」先于「birmingham」
         if key in low:
@@ -377,6 +388,7 @@ def open_status(opening_hours: str, now: Optional[datetime] = None) -> str:
 FOOD_AMENITIES = ("restaurant", "cafe", "fast_food", "pub", "bar", "food_court", "ice_cream")
 _CACHE: Dict[str, Tuple[float, Dict[str, Any]]] = {}
 CACHE_TTL = 6 * 3600
+_DEFAULT_KEYWORD_LIMIT = 6
 
 
 @dataclass
@@ -395,13 +407,14 @@ class Shop:
     distance_m: int = 0
     walk_min: int = 0
     open_now: str = "unknown"
+    diet: str = ""
 
     def to_dict(self) -> Dict[str, Any]:
         return asdict(self)
 
 
-def clean_keywords(keywords: Optional[List[str]]) -> List[str]:
-    """口味关键词清洗：小写、只留字母数字空格下划线连字符、去重、最多 6 个。
+def clean_keywords(keywords: Optional[List[str]], *, limit: int = _DEFAULT_KEYWORD_LIMIT) -> List[str]:
+    """口味关键词清洗：小写、只留字母数字空格下划线连字符、去重、默认最多 6 个。
 
     关键词来自模型对用户问题的理解，会拼进 Overpass 查询语句，所以必须先清洗，防止查询注入。
     """
@@ -410,37 +423,42 @@ def clean_keywords(keywords: Optional[List[str]]) -> List[str]:
         k = re.sub(r"[^a-z0-9 _\-]", "", str(k).lower()).strip()
         if 2 <= len(k) <= 30 and k not in out:
             out.append(k)
-    return out[:6]
+    return out[:limit]
 
 
 def _kw_pattern(kws: List[str]) -> str:
-    """关键词 → 正则：下划线和空格可互换（hot_pot 匹配 Hot Pot / hotpot）。"""
-    return "|".join(re.sub(r"[ _]", "[ _]?", k) for k in kws)
+    """关键词 → 正则：空格和下划线可互换或省略；超过 3 个字符的词可省略末尾 s。"""
+    return "|".join(
+        re.sub(r"[ _]", "[ _]?", k) + ("?" if len(k) > 3 and k.endswith("s") else "")
+        for k in kws
+    )
 
 
 DIET_KW = ("vegan", "vegetarian", "halal")  # OSM 用 diet:vegan=yes 这类标签表示，不写在 cuisine 里
 
 
-def _diet_words(tags: Dict[str, str]) -> str:
-    return " ".join(d for d in DIET_KW if tags.get(f"diet:{d}") in ("yes", "only"))
+def _diet_words(tags: Dict[str, str]) -> List[str]:
+    return [d for d in DIET_KW if tags.get(f"diet:{d}") in ("yes", "only")]
 
 
 def _overpass_query(lat: float, lon: float, radius: int, amenities: Tuple[str, ...],
-                    keywords: Optional[List[str]] = None) -> str:
+                    keywords: Optional[List[str]] = None, *, keyword_limit: int = _DEFAULT_KEYWORD_LIMIT) -> str:
     pattern = "|".join(amenities)
-    kws = clean_keywords(keywords)
+    kws = clean_keywords(keywords, limit=keyword_limit)
     base = f'nwr(around:{radius},{lat:.6f},{lon:.6f})[amenity~"^({pattern})$"][name]'
     if not kws:
         return f'[out:json][timeout:12];{base};out center tags;'
-    # 口味在服务器端过滤：名称或菜系里含任一关键词（不区分大小写）；素食/清真另查 diet:* 标签，取并集
-    parts = [f'{base}[~"^(name|cuisine)$"~"{_kw_pattern(kws)}",i];']
-    parts += [f'{base}["diet:{d}"~"^(yes|only)$"];' for d in DIET_KW if d in kws]
+    cuisine_kws = [k for k in kws if k not in DIET_KW]
+    # 有菜系关键词时只在服务器端查菜系；只有饮食关键词时按名称、菜系和 diet:* 标签取并集。
+    parts = [f'{base}[~"^(name|cuisine)$"~"{_kw_pattern(cuisine_kws or kws)}",i];']
+    if not cuisine_kws:
+        parts += [f'{base}["diet:{d}"~"^(yes|only)$"];' for d in DIET_KW if d in kws]
     return f'[out:json][timeout:12];({"".join(parts)});out center tags;'
 
 
 def tag_text(tags: Dict[str, str]) -> str:
     """程序端匹配口味用的文本：店名 + 菜系 + 饮食标签。"""
-    return f"{tags.get('name', '')} {tags.get('cuisine', '')} {_diet_words(tags)}"
+    return f"{tags.get('name', '')} {tags.get('cuisine', '')} {' '.join(_diet_words(tags))}"
 
 
 # 熔断：某台服务器超时或报错后，接下来 CIRCUIT_SECONDS 秒内直接跳过它。
@@ -482,12 +500,11 @@ def _fetch_overpass(query: str, http: Callable[..., Any], budget: Optional[float
 
 
 _SNAP_CACHE: Dict[str, Tuple[float, Any]] = {}
-PLANNED_SNAPSHOT_RADIUS = 1500  # 不限口味、半径 ≥ 这个值：直接用当天的快照（实测这类查询在线要 15 秒以上）
-PLANNED_SNAPSHOT_MAX_AGE = 2    # 快照超过几天就不再优先使用
+PLANNED_SNAPSHOT_MAX_AGE = 2  # 快照超过几天就不再优先使用
 
 
 def load_snapshot(path: Optional[str] = None) -> Optional[Dict[str, Any]]:
-    """离线门店快照（scripts/build_poi_snapshot.py 生成）：大范围查询直接用，在线服务器都失败时兜底。
+    """离线门店快照（scripts/build_poi_snapshot.py 生成）：数据够新时优先用，在线服务器都失败时也可兜底。
 
     按文件修改时间缓存，重建快照后自动重新读取。path 留空时用 SNAPSHOT_PATH（测试里可以改成不存在的路径）。
     """
@@ -519,40 +536,50 @@ def _from_snapshot(lat: float, lon: float, radius: int, amenities: Tuple[str, ..
 
 def nearby(lat: float, lon: float, *, radius: int = 800, keywords: Optional[List[str]] = None,
            amenities: Tuple[str, ...] = FOOD_AMENITIES, now: Optional[datetime] = None,
-           http: Callable[..., Any] = _http_json, snapshot: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
+           http: Callable[..., Any] = _http_json, snapshot: Optional[Dict[str, Any]] = None,
+           keyword_limit: int = _DEFAULT_KEYWORD_LIMIT) -> Dict[str, Any]:
     """查周边门店，返回 {shops, server, data_time, radius, cached, ...}。
 
-    keywords（如 indian / curry / pizza，由上游把用户的说法整理成英文关键词）在 Overpass 查询里过滤，
-    程序端再按名称和菜系过滤一遍（快照兜底时只有程序端过滤）。
+    快照覆盖范围且数据够新时优先使用。程序端按名称和菜系匹配任一菜系关键词，
+    有菜系关键词时要求满足所有饮食条件，只有饮食关键词时满足任一条件即可。
     """
-    kws = clean_keywords(keywords)
+    kws = clean_keywords(keywords, limit=keyword_limit)
     key = f"{lat:.3f},{lon:.3f},{radius},{'|'.join(amenities)},{'|'.join(kws)}"
-    hit = _CACHE.get(key)
-    cached = bool(hit and time.time() - hit[0] < CACHE_TTL)
+    faults = _faults()
+    overpass_fault = any(f.startswith("overpass_") for f in faults)
+    snap = None
     planned = None
-    if not cached and not kws and radius >= PLANNED_SNAPSHOT_RADIUS:
+    if not overpass_fault:
         snap = _from_snapshot(lat, lon, radius, amenities, snapshot if snapshot is not None else load_snapshot())
-        age = _data_age_days(snap["data_time"]) if snap else None
-        if snap and age is not None and age <= PLANNED_SNAPSHOT_MAX_AGE:
-            planned = dict(snap, fallback_reason="", planned=True)
-    if cached:
-        payload = hit[1]
-    elif planned:
+        if snap is not None:
+            age = _data_age_days(snap["data_time"])
+            if age is not None and age <= PLANNED_SNAPSHOT_MAX_AGE:
+                planned = dict(snap, planned=True)
+    hit = _CACHE.get(key)
+    cached = planned is None and bool(hit and time.time() - hit[0] < CACHE_TTL)
+    if planned is not None:
         payload = planned
+    elif cached:
+        payload = hit[1]
     else:
         try:
-            data, server = _fetch_overpass(_overpass_query(lat, lon, radius, amenities, kws), http)
+            query = _overpass_query(lat, lon, radius, amenities, kws, keyword_limit=keyword_limit)
+            data, server = _fetch_overpass(query, http)
             payload = {"elements": data.get("elements", []), "server": server,
                        "data_time": (data.get("osm3s") or {}).get("timestamp_osm_base", "")}
             _CACHE[key] = (time.time(), payload)
         except ToolError as exc:
-            snap = _from_snapshot(lat, lon, radius, amenities, snapshot if snapshot is not None else load_snapshot())
+            if overpass_fault:
+                snap = _from_snapshot(lat, lon, radius, amenities, snapshot if snapshot is not None else load_snapshot())
             if snap is None:
                 raise
             payload = dict(snap, fallback_reason=exc.message)
-    elements = [] if "overpass_empty" in _faults() else payload["elements"]
+    elements = [] if "overpass_empty" in faults else payload["elements"]
 
-    kw_re = re.compile(_kw_pattern(kws), re.I) if kws else None
+    cuisine_kws = [k for k in kws if k not in DIET_KW]
+    diet_kws = [d for d in DIET_KW if d in kws]
+    cuisine_re = re.compile(_kw_pattern(cuisine_kws), re.I) if cuisine_kws else None
+    diet_matches = all if cuisine_kws else any
     shops: List[Shop] = []
     seen = set()
     for el in elements:
@@ -564,8 +591,13 @@ def nearby(lat: float, lon: float, *, radius: int = 800, keywords: Optional[List
         plon = el.get("lon") or (el.get("center") or {}).get("lon")
         if plat is None or plon is None:
             continue
-        if kw_re and not kw_re.search(tag_text(t)):
+        cuisine = t.get("cuisine", "")
+        if cuisine_re and not (cuisine_re.search(name) or cuisine_re.search(cuisine)):
             continue
+        if diet_kws:
+            text = tag_text(t).lower()
+            if not diet_matches(d in text for d in diet_kws):
+                continue
         dedup = (name.lower(), round(plat, 4), round(plon, 4))
         if dedup in seen:
             continue
@@ -573,11 +605,11 @@ def nearby(lat: float, lon: float, *, radius: int = 800, keywords: Optional[List
         d = distance_m(lat, lon, plat, plon)
         addr = " ".join(x for x in (t.get("addr:housenumber", ""), t.get("addr:street", "")) if x)
         shops.append(Shop(
-            name=name, lat=plat, lon=plon, amenity=t.get("amenity", ""), cuisine=t.get("cuisine", ""),
+            name=name, lat=plat, lon=plon, amenity=t.get("amenity", ""), cuisine=cuisine,
             opening_hours=t.get("opening_hours", ""), address=addr, postcode=t.get("addr:postcode", ""),
             website=t.get("website") or t.get("contact:website", ""), phone=t.get("phone") or t.get("contact:phone", ""),
             osm_id=f"{el.get('type', 'node')}/{el.get('id')}", distance_m=round(d), walk_min=walk_minutes(d),
-            open_now=open_status(t.get("opening_hours", ""), now)))
+            open_now=open_status(t.get("opening_hours", ""), now), diet=";".join(_diet_words(t))))
     shops.sort(key=lambda s: s.distance_m)
     stale = _data_age_days(payload["data_time"])
     return {"shops": [s.to_dict() for s in shops], "server": payload["server"], "data_time": payload["data_time"],
@@ -588,7 +620,7 @@ def nearby(lat: float, lon: float, *, radius: int = 800, keywords: Optional[List
 
 def _data_age_days(ts: str) -> Optional[int]:
     try:
-        return (datetime.now(LONDON) - datetime.fromisoformat(ts.replace("Z", "+00:00"))).days
+        return (london_now() - datetime.fromisoformat(ts.replace("Z", "+00:00"))).days
     except ValueError:
         return None
 
@@ -602,7 +634,8 @@ def nearby_expanding(lat: float, lon: float, *, keywords: Optional[List[str]] = 
                      **kw: Any) -> Dict[str, Any]:
     """结果太少就逐级扩大半径；返回值多一个 tried_radii。
 
-    - 第一次就转了快照，后面扩大半径时直接用快照（否则一次请求可能连等三轮在线超时）；
+    - 在线失败转了快照后，扩大半径时仍用快照（避免一次请求连等三轮在线超时）；
+    - 主动使用快照后扩大半径，如果超出覆盖范围，仍可尝试在线；
     - 扩大半径那一步失败（例如超出快照范围），返回上一步已经拿到的结果，不让整次请求失败。
     """
     tried: List[int] = []
@@ -614,11 +647,11 @@ def nearby_expanding(lat: float, lon: float, *, keywords: Optional[List[str]] = 
             if last is None:
                 raise
             break
-        if last is not None and last.get("from_snapshot"):
+        if last is not None and last["fallback_reason"]:
             cur["fallback_reason"] = last["fallback_reason"]
         last = cur
         tried.append(r)
-        if last.get("from_snapshot"):
+        if last["from_snapshot"] and not last["snapshot_planned"]:
             kw["http"] = _snapshot_only
         if len(last["shops"]) >= min_results:
             break

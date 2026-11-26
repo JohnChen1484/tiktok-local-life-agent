@@ -1,8 +1,8 @@
-"""生成离线门店快照 assets/poi_snapshot.json（在线地图服务都失败时兜底用）。
+"""生成离线门店快照 assets/poi_snapshot.json（用于优先查询和在线失败时兜底）。
 
-默认：伯明翰 New Street 站为中心、半径 4 公里内所有有名字的餐饮门店。
+默认：伯明翰 New Street 站为中心、半径 6 公里内所有有名字的餐饮门店。
 离线运行，可以慢：依次试 mail.ru 镜像和 Overpass 主站，每台最多等 90 秒。
-建议每周跑一次；回答里会写明快照的数据日期。
+建议每天跑一次，便于优先使用快照；回答里会写明快照的数据日期。
 
 用法（项目根目录下）：
   python3 scripts/build_poi_snapshot.py
@@ -25,7 +25,7 @@ KEEP_TAGS = ("name", "amenity", "cuisine", "opening_hours", "addr:housenumber", 
 
 def main():
     ap = argparse.ArgumentParser()
-    ap.add_argument("--radius", type=int, default=4000)
+    ap.add_argument("--radius", type=int, default=6000)
     args = ap.parse_args()
     lat, lon = L.DEFAULT_CENTER
     query = L._overpass_query(lat, lon, args.radius, L.FOOD_AMENITIES).replace(

@@ -43,7 +43,7 @@ import locallife_tools as L  # noqa: E402
 
 logger = logging.getLogger(__name__)
 
-AGENT_VERSION = "w5.3"  # 写进每个回答的 json，评测报告据此确认是哪个版本在作答
+AGENT_VERSION = "w5.4"  # 写进每个回答的 json，评测报告据此确认是哪个版本在作答
 LLM_CONFIG = "config/agent_llm_config.json"
 MAX_MESSAGES = 40
 TOP_N = 5                # 最多推荐几家
@@ -61,6 +61,7 @@ CATEGORY_AMENITIES: Dict[str, Tuple[str, ...]] = {
     "dessert": ("ice_cream", "cafe"),
     "any": L.FOOD_AMENITIES,
 }
+DEFAULT_DESSERT_KEYWORDS = ("dessert", "cake", "ice_cream", "waffle", "crepe", "bubble_tea", "gelato", "donut", "patisserie")
 # 这些词说明的是「类别」，不是口味：留作关键词会把没写菜系的咖啡馆、酒吧都筛掉
 GENERIC_KW = {"coffee", "cafe", "cafes", "pub", "pubs", "bar", "bars", "beer", "pint", "pints", "drinks", "drink",
               "cocktail", "cocktails", "food", "restaurant", "restaurants", "eat", "dessert", "desserts", "dinner",
@@ -164,6 +165,7 @@ T: Dict[str, Dict[str, str]] = {
         "zh": "_地图：OpenStreetMap（{server}，数据 {date}）。距离为直线距离，步行时间为估算。"
               "「热门」指近期英国网页来源提到过：TikTok 没有开放本地门店数据接口。_",
     },
+    "daily_snapshot": {"en": "daily snapshot", "zh": "每日快照"},
     "trend_few": {
         "en": "Only {n} of the places nearby show up in recent TikTok-related or web sources, so the list is short.",
         "zh": "附近只有 {n} 家店出现在近期 TikTok 相关或网页来源里，所以列得不多。",
@@ -586,7 +588,7 @@ def _radii(slots: Dict[str, Any], place: Dict[str, Any]) -> Tuple[int, ...]:
         meters = int(slots["max_walk_min"] * L.WALK_SPEED_M_PER_MIN / L.ROUTE_FACTOR)
         return (max(200, min(meters, 3000)),)
     if slots.get("want_trending") and place.get("origin") in ("default", "city"):
-        return (1500, 3000)  # 问全城热门、没给位置：范围放大（不限口味时直接用当天快照），排序更看重热度
+        return (1500, 3000)  # 问全城热门、没给位置：范围放大，排序更看重热度
     if not slots.get("keywords"):
         return (400, 800, 1500)  # 不限口味时店很多（New Street 800 米内 524 家），实测在线查 800 米要 15 秒以上
     return (800, 1500, 3000)
@@ -595,9 +597,16 @@ def _radii(slots: Dict[str, Any], place: Dict[str, Any]) -> Tuple[int, ...]:
 def node_nearby(state: AgentState) -> Dict[str, Any]:
     slots, place, lang = state["slots"], state["place"], state["lang"]
     notes, degraded = list(state.get("notes") or []), list(state.get("degraded") or [])
+    category, keywords = slots["category"], slots["keywords"]
+    amenities = CATEGORY_AMENITIES[category]
+    options = {}
+    if category == "dessert" and not keywords:
+        keywords = list(DEFAULT_DESSERT_KEYWORDS)
+        amenities = ("ice_cream", "cafe", "fast_food", "restaurant")
+        options["keyword_limit"] = len(keywords)
     try:
-        r = L.nearby_expanding(place["lat"], place["lon"], keywords=slots["keywords"],
-                               amenities=CATEGORY_AMENITIES[slots["category"]], radii=_radii(slots, place))
+        r = L.nearby_expanding(place["lat"], place["lon"], keywords=keywords, amenities=amenities,
+                               radii=_radii(slots, place), **options)
     except L.ToolError as exc:
         notes.append(_t("map_down", lang))
         return {"shops": [], "notes": notes, "degraded": degraded + ["map_unavailable"],
@@ -606,7 +615,7 @@ def node_nearby(state: AgentState) -> Dict[str, Any]:
             "data_time": r["data_time"], "from_snapshot": r["from_snapshot"], "radius": r["radius"],
             "tried_radii": r["tried_radii"], "cached": r["cached"], "found": len(r["shops"])}
     info["snapshot_planned"] = r.get("snapshot_planned", False)
-    if r["from_snapshot"] and not r.get("snapshot_planned"):  # 计划内的大范围快照不算降级
+    if r["from_snapshot"] and not r.get("snapshot_planned"):  # 主动使用快照不算降级
         info["fallback_reason"] = r["fallback_reason"][:200]
         notes.append(_t("map_snapshot", lang, date=r["data_time"][:10]))
         degraded.append("map_snapshot")
@@ -678,7 +687,8 @@ def node_search(state: AgentState) -> Dict[str, Any]:
     # 排序：问热门时 TikTok 相关的在前；和用户同语言的在前；越新越前
     found.sort(key=lambda i: (not (slots["want_trending"] and i["tiktok"]), i["lang"] != lang, i["age_days"] or 0))
     if sum(i["lang"] == lang for i in found) >= 3:
-        found = [i for i in found if i["lang"] != "other"]  # 同语言来源够了，就不用意大利语等其他语言的页面
+        dropped_langs = {"zh", "other"} if lang == "en" else {"other"}
+        found = [i for i in found if i["lang"] not in dropped_langs]
     sources = [dict(it, id=f"S{n}") for n, it in enumerate(found[:MAX_SOURCES], 1)]
     info["used"] = len(sources)
     if queries and len(info["errors"]) == len(queries):
@@ -692,6 +702,12 @@ def node_search(state: AgentState) -> Dict[str, Any]:
 # --------------------------------------------------------------------------- #
 # 5. rank：程序排序
 # --------------------------------------------------------------------------- #
+_DEAL_EVIDENCE_RE = re.compile(
+    r"\b(?:deals?|offers?|set[\s-]+menus?|discount(?:s|ed)?|bottomless|vouchers?)\b|[£%]|套餐|优惠|团购|折扣",
+    re.I,
+)
+
+
 def node_rank(state: AgentState) -> Dict[str, Any]:
     slots, lang, place = state["slots"], state["lang"], state["place"]
     shops, sources = state.get("shops") or [], state.get("sources") or []
@@ -707,7 +723,8 @@ def node_rank(state: AgentState) -> Dict[str, Any]:
             continue
         hit = [sources[i] for i in L.mentions(s["name"], sources)]
         hot = [x["id"] for x in hit]
-        deals = [x["id"] for x in hit if x["kind"] == "deals"]
+        deals = [x["id"] for x in hit if x["kind"] == "deals"
+                 and any(_DEAL_EVIDENCE_RE.search(x[k]) for k in ("title", "snippet"))]
         score = (1 - min(s["distance_m"], max_d) / max_d) * (0.4 if trending else 1.0)
         score += min(len(hot), 3) / 3 * (1.2 if trending else 0.5)
         score += 0.3 * bool(deals) if slots.get("want_deals") else 0.0
@@ -715,7 +732,8 @@ def node_rank(state: AgentState) -> Dict[str, Any]:
         score += 0.05 * bool(s["opening_hours"] or s["website"])
         if budget and budget <= 12 and s["amenity"] in ("fast_food", "food_court", "cafe"):
             score += 0.2
-        picks.append({"name": s["name"], "type": s["amenity"], "cuisine": s["cuisine"], "distance_m": s["distance_m"],
+        picks.append({"name": s["name"], "type": s["amenity"], "cuisine": s["cuisine"], "diet": s.get("diet", ""),
+                      "distance_m": s["distance_m"],
                       "walk_min": s["walk_min"], "open_now": s["open_now"], "opening_hours": s["opening_hours"],
                       "address": " ".join(x for x in (s["address"], s["postcode"]) if x), "website": s["website"],
                       "osm_id": s["osm_id"], "sources": hot, "deal_sources": deals,
@@ -759,16 +777,17 @@ ANSWER_SYS = """You are a local food & drink guide for TikTok users in the UK (d
 Write the reply in {language}, using ONLY the FACTS JSON. Rules:
 1. Recommend up to 5 places from FACTS.shops, best first (they are already ranked), as a numbered list with one
    place per item. Start each item with the place name in bold, exactly as written in FACTS, e.g. "1. **Asha's** — ...".
-   Bold nothing else.
+   Bold nothing else. Use bullets if the rewrite asks you to omit numbers other than distance and walking time.
 2. For each place give its distance and walking time exactly as in FACTS (say the walk is an estimate once),
    its opening status (open now / closed / hours not listed) and one short reason drawn from FACTS
    (cuisine, type, listed hours, mentioned by a source). If you mention hours, copy them exactly from
    FACTS.opening_hours (24-hour clock).
-3. Popularity, TikTok buzz, deals, prices and ratings may only come from FACTS.sources snippets, with the source id
-   in brackets, e.g. [S2]. Never invent prices, ratings, reviews, dishes or deals. If the user asked for deals and no
-   source mentions one for these places, say you couldn't find a current deal for them.
+3. Popularity, TikTok buzz, prices and ratings may only come from FACTS.sources snippets, with the source id in
+   brackets, e.g. [S2]. On any line that mentions TikTok and cites sources, every cited source must have tiktok=true.
+   Never invent prices, ratings, reviews, dishes or deals. For deals about a place, use titles or snippets from its
+   deal_sources only and cite them. If asked for deals and the places have no deal_sources, say you couldn't find a current deal.
 4. Do not recommend or bold any place that is not in FACTS.shops. If FACTS.shops is empty, list up to 3 useful
-   sources by id and explain that distances couldn't be checked.
+   sources by id, explain that distances couldn't be checked, and do not bold anything.
 5. FACTS.notes are shown to the user separately: do not repeat them. Do not list URLs; sources are appended for you.
 6. Keep it under 170 words (Chinese: under 320 characters). Plain friendly tone, no headings."""
 
@@ -780,8 +799,8 @@ def _facts(state: AgentState) -> Dict[str, Any]:
         "location": {"name": (state.get("place") or {}).get("name", ""), "origin": (state.get("place") or {}).get("origin", "")},
         "request": {k: slots.get(k) for k in ("keywords", "category", "open_now", "budget_gbp", "want_deals",
                                               "want_trending", "max_walk_min")},
-        "shops": [{k: p[k] for k in ("name", "type", "cuisine", "distance_m", "walk_min", "open_now", "opening_hours",
-                                     "address", "sources", "deal_sources", "tiktok_sources")}
+        "shops": [dict({k: p[k] for k in ("name", "type", "cuisine", "distance_m", "walk_min", "open_now", "opening_hours",
+                                          "address", "sources", "deal_sources", "tiktok_sources")}, diet=p.get("diet", ""))
                   for p in state.get("picks") or []],
         "sources": [{"id": s["id"], "title": s["title"], "site": s["site"], "age_days": s["age_days"],
                      "tiktok": s["tiktok"], "snippet": s["snippet"][:220]} for s in state.get("sources") or []],
@@ -795,6 +814,8 @@ def node_answer(state: AgentState) -> Dict[str, Any]:
     problems = (state.get("verify_result") or {}).get("problems") or []
     if state.get("retry") and problems:
         user += "\n\nYour previous draft failed these checks. Fix them:\n- " + "\n- ".join(problems)
+        if any(p.startswith(_NUMBER_PROBLEM_PREFIXES) for p in problems):
+            user += "\n\nDo not write any opening times or numbers other than distance_m and walk_min"
     try:
         draft = _invoke_text(ANSWER_SYS.format(language=LANG_NAMES.get(state.get("lang"), "English")), user).strip()
     except Exception as exc:  # noqa: BLE001
@@ -811,6 +832,7 @@ _UNIT_AFTER_RE = re.compile(r"^\s*(?:-\s*)?(?:m\b|metres?|meters?|km\b|kilomet|m
 _PRICE_RE = re.compile(r"£\s?(\d+(?:\.\d{1,2})?)")
 _RATING_RE = re.compile(r"(\d(?:\.\d)?)\s*(?:/\s*5|stars?|★|星|分(?!钟))", re.I)
 _BUDGET_WORDS_RE = re.compile(r"budget|under|within|less than|up to|or less|预算|以内|以下|不超过", re.I)
+_NUMBER_PROBLEM_PREFIXES = ("the number ", "the price ", "the rating ")
 
 
 def _norm(text: str) -> str:
@@ -833,10 +855,14 @@ def verify_draft(draft: str, facts: Dict[str, Any], question: str) -> List[str]:
             problems.append(f"“{b}” is in bold but is not a place in FACTS.shops")
     if facts["shops"] and not any(_norm(b) in names for b in bolds):
         problems.append("name the recommended places from FACTS.shops in bold")
-    ids = {s["id"] for s in facts["sources"]}
-    for sid in re.findall(r"\[(S\d+)\]", draft):
-        if sid not in ids:
-            problems.append(f"[{sid}] is not a source id in FACTS.sources")
+    sources_by_id = {s["id"]: s for s in facts["sources"]}
+    for line in draft.splitlines():
+        mentions_tiktok = "tiktok" in line.lower()
+        for sid in re.findall(r"\[(S\d+)\]", line):
+            if sid not in sources_by_id:
+                problems.append(f"[{sid}] is not a source id in FACTS.sources")
+            elif mentions_tiktok and sources_by_id[sid].get("tiktok") is not True:
+                problems.append(f"[{sid}] does not support a TikTok claim (FACTS.sources tiktok is not true)")
     body = re.sub(r"\[S\d+\]", " ", draft)
     allowed = _tokens(json.dumps(facts, ensure_ascii=False)) | _tokens(question)
     distances = [s["distance_m"] for s in facts["shops"]]
@@ -871,8 +897,14 @@ def verify_draft(draft: str, facts: Dict[str, Any], question: str) -> List[str]:
 
 
 def node_verify(state: AgentState) -> Dict[str, Any]:
-    problems = verify_draft(state.get("draft") or "", _facts(state), state.get("question") or "")
-    return {"verify_result": {"ok": not problems, "problems": problems[:6], "attempts": int(state.get("retry") or 0)}}
+    draft = state.get("draft") or ""
+    problems = verify_draft(draft, _facts(state), state.get("question") or "")
+    rejected = list((state.get("verify_result") or {}).get("rejected") or [])
+    if problems:
+        rejected.append(draft[:300])
+        problems.sort(key=lambda p: not p.startswith(_NUMBER_PROBLEM_PREFIXES))  # 数字错误优先反馈给重写提示
+    return {"verify_result": {"ok": not problems, "problems": problems[:6], "attempts": int(state.get("retry") or 0),
+                              "rejected": rejected}}
 
 
 # --------------------------------------------------------------------------- #
@@ -947,7 +979,8 @@ def node_format(state: AgentState) -> Dict[str, Any]:
         parts.append(body)
         mi = state.get("map_info") or {}
         if mi.get("server"):
-            parts.append(_t("data_note", lang, server=mi["server"], date=(mi.get("data_time") or "")[:10]))
+            server = _t("daily_snapshot", lang) if mi["server"] == "snapshot" and mi.get("snapshot_planned") else mi["server"]
+            parts.append(_t("data_note", lang, server=server, date=(mi.get("data_time") or "")[:10]))
         src = _source_lines(state.get("sources") or [], body, slots, lang)
         if src:
             parts.append(_t("sources", lang) + "\n" + "\n".join(src))

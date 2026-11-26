@@ -34,28 +34,33 @@ def split_reply(content):
     return content.split("```json")[0].strip(), payload
 
 
-ENV_FALLBACK = {"map_snapshot"}  # 没注入故障、但在线地图服务器真的没响应 → 走快照，属于环境波动，不算智能体出错
+ENV_FALLBACK = {"map_snapshot", "map_unavailable"}  # 没注入故障且只有地图降级时，属于环境波动
 
 
 def env_fallback(case, js):
     deg = set(js.get("degraded") or [])
-    return not case.get("fault") and js.get("status") == "degraded" and deg and deg <= ENV_FALLBACK
+    return not case.get("fault") and bool(deg) and deg <= ENV_FALLBACK
 
 
 def check(exp, text, js, env=False):
-    """返回未通过的检查项列表。env=True 时，期望 ok 而实际因环境波动走了快照，状态这一项不算失败。"""
+    """返回未通过的检查项列表；地图完全不可用的环境波动改查正文是否说明无法算距离。"""
     bad = []
     req = js.get("request") or {}
     loc = js.get("location") or {}
     shops = js.get("shops") or []
     srcs = js.get("sources") or []
     body = text.split("Sources:")[0].split("来源：")[0]
+    map_unavailable = env and "map_unavailable" in (js.get("degraded") or [])
     if js.get("version") != A.AGENT_VERSION:
         bad.append(f"版本 {js.get('version')} ≠ {A.AGENT_VERSION}")
-    if js.get("status") not in exp.get("status", [js.get("status")]) and not (env and "ok" in exp.get("status", [])):
-        bad.append(f"status={js.get('status')}，期望 {exp['status']}")
-    if "min_shops" in exp and len(shops) < exp["min_shops"]:
-        bad.append(f"门店 {len(shops)} < {exp['min_shops']}")
+    if map_unavailable:
+        if not re.search(r"can['’]t check distances|没法算距离", body, re.I):
+            bad.append("地图完全不可用时，正文没有说明无法计算距离")
+    else:
+        if "status" in exp and js.get("status") not in exp["status"] and not (env and "ok" in exp["status"]):
+            bad.append(f"status={js.get('status')}，期望 {exp['status']}")
+        if "min_shops" in exp and len(shops) < exp["min_shops"]:
+            bad.append(f"门店 {len(shops)} < {exp['min_shops']}")
     if "min_sources" in exp and len(srcs) < exp["min_sources"]:
         bad.append(f"来源 {len(srcs)} < {exp['min_sources']}")
     if "max_sources" in exp and len(srcs) > exp["max_sources"]:
@@ -154,15 +159,28 @@ def main():
             rows.append(row)
             jl.write(json.dumps(row, ensure_ascii=False) + "\n")
             v = js.get("verify") or {}
+            env_note = ""
+            if env:
+                env_note = "（环境波动，地图完全不可用）" if "map_unavailable" in js["degraded"] else "（环境波动，走了快照）"
             print(f"{'✓' if not bad else '✗'} {c['id']:4} {js.get('status', '-'):15} 店 {len(js.get('shops') or []):>2} "
                   f"源 {len(js.get('sources') or []):>2} 核对 {'模板' if v.get('templated') else v.get('attempts', '-')}"
-                  f"  {row['seconds']:>5} 秒  {'（在线地图没响应，走了快照）' if env else ''}{'；'.join(bad)}")
+                  f"  {row['seconds']:>5} 秒  {env_note}{'；'.join(bad)}")
 
     # ---- 报告
     by_cat = defaultdict(lambda: [0, 0])
+    map_counts = defaultdict(int)
     for r in rows:
         by_cat[r["category"]][0] += r["pass"]
         by_cat[r["category"]][1] += 1
+        js = r["json"]
+        mi = js.get("map") or {}
+        server = mi.get("server")
+        if "map_unavailable" in (js.get("degraded") or []):
+            map_counts["unavailable"] += 1
+        elif server == "snapshot":
+            map_counts["planned" if mi.get("snapshot_planned") else "fallback"] += 1
+        elif server:
+            map_counts["online"] += 1
     rec = [r for r in rows if (r["json"].get("status") in ("ok", "degraded"))]
     templ = sum(bool((r["json"].get("verify") or {}).get("templated")) for r in rec)
     retried = sum((r["json"].get("verify") or {}).get("attempts", 0) >= 2 for r in rec)
@@ -174,27 +192,35 @@ def main():
              f"- 时间：英国 {L.london_now():%Y-%m-%d %H:%M}；版本：{A.AGENT_VERSION}；用例集：{os.path.basename(args.set)}",
              f"- 通过：**{passed}/{len(rows)}**",
              f"- 推荐类回答 {len(rec)} 条：重写过 {retried} 条，改用模板 {templ} 条",
-             f"- 环境波动：{sum(r['env'] for r in rows)} 条没注入故障、但在线地图没响应而走了快照（按通过计，单独列出）",
+             f"- 环境波动 {sum(r['env'] for r in rows)} 条（未注入故障，且仅发生地图降级）",
+             f"- 在线地图成功 {map_counts['online']} 条，按计划用快照 {map_counts['planned']} 条，"
+             f"因故障转快照 {map_counts['fallback']} 条，地图完全不可用 {map_counts['unavailable']} 条",
              f"- 单轮耗时（最后一轮）：中位 {p50 / 1000:.1f} 秒，P90 {p90 / 1000:.1f} 秒", "",
              "| 类别 | 通过 |", "|---|---|"]
     lines += [f"| {k} | {a}/{b} |" for k, (a, b) in by_cat.items()]
     lines += ["", "| 用例 | 类别 | 故障 | 状态 | 店 | 源 | 降级 | 核对 | 秒 | 结果 |", "|---|---|---|---|---|---|---|---|---|---|"]
     for r in rows:
         js, v = r["json"], r["json"].get("verify") or {}
+        result = "✓" if r["pass"] else "✗ " + "；".join(r["problems"])
+        env_note = "（环境波动）" if r["env"] else ""
         lines.append(f"| {r['id']} | {r['category']} | {r['fault'] or '-'} | {js.get('status', '-')} | {len(js.get('shops') or [])} | "
                      f"{len(js.get('sources') or [])} | {','.join(js.get('degraded') or []) or '-'} | "
-                     f"{'模板' if v.get('templated') else v.get('attempts', '-')} | {r['seconds']} | "
-                     f"{('✓' + ('（环境波动）' if r['env'] else '')) if r['pass'] else '✗ ' + '；'.join(r['problems'])} |")
+                     f"{'模板' if v.get('templated') else v.get('attempts', '-')} | {r['seconds']} | {result}{env_note} |")
     lines += ["", "## 逐条回答（供人工检查语气、理由是否有依据）", ""]
     for r in rows:
         js = r["json"]
+        v = js.get("verify") or {}
         lines += [f"### {r['id']}｜{' → '.join(r['turns'])}", "",
                   f"状态 `{js.get('status')}`；需求 `{json.dumps(js.get('request'), ensure_ascii=False)}`；"
                   f"位置 `{(js.get('location') or {}).get('name')}`（{(js.get('location') or {}).get('origin')}）；"
                   f"地图 `{(js.get('map') or {}).get('server', '-')}`；搜索词 `{(js.get('search') or {}).get('queries')}`", ""]
-        if (js.get("verify") or {}).get("problems"):
-            lines.append(f"核对发现：{'；'.join(js['verify']['problems'])}\n")
+        if v.get("problems"):
+            lines.append(f"核对发现：{'；'.join(v['problems'])}\n")
         lines += ["```text", r["reply"][:1500], "```", ""]
+        for attempt, draft in enumerate(v.get("rejected") or [], 1):
+            lines += [f"被拒草稿 {attempt}（前 300 字）", ""]
+            lines.extend(f"    {line}" for line in (draft or "（空草稿）").splitlines())
+            lines.append("")
     with open(base + ".md", "w", encoding="utf-8") as fh:
         fh.write("\n".join(lines))
     print(f"\n通过 {passed}/{len(rows)}；报告：{os.path.relpath(base + '.md', ROOT)}")
